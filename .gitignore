@@ -4,3 +4,4 @@ logs/
 history/
 .venv/
 __pycache__/
+chrome_tools.json

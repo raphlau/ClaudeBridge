@@ -8,7 +8,8 @@ published to the internet through **Tailscale Funnel**. It gives Claude, from an
 - PDF text, PDF pages and images as pictures, and full-text search across notes.
 - Short-lived download and upload links, so Claude can move big or binary files between your PC and its cloud workspace.
 - **Sync kept running:** before every change it makes, the bridge checks that the **MEGA app** and **Obsidian** (with your vault open) are running, and starts them if not, so changes get uploaded. It also checks once at sign-in.
-- **App control:** Claude can check, start and close **MEGA, Obsidian, Chrome and the Claude desktop app** (`app_status`, `start_app`, `quit_app`). It can't close MEGA or Obsidian, since they do the syncing. This lets you turn on computer access and Claude in Chrome only while you need them.
+- **App control:** Claude can check, start and close **MEGA, Obsidian, Chrome and the Claude desktop app** (`app_status`, `start_app`, `quit_app`). It can't close MEGA or Obsidian, since they do the syncing. This lets you turn on computer access only while you need it.
+- **Claude in Chrome from any chat:** the bridge passes through Claude in Chrome's browser tools (`navigate`, `computer`, `read_page`, `find`, `get_page_text`, `tabs_context_mcp`...), using Claude Code on this PC. Any chat with the connector can use Chrome here, including one started on your phone that isn't linked to the computer. See [Claude in Chrome](#claude-in-chrome-from-any-chat).
 
 It doesn't need the Claude desktop app running, and it doesn't use the app's computer-access setting.
 
@@ -19,8 +20,9 @@ It doesn't need the Claude desktop app running, and it doesn't use the app's com
 - **No accidental overwrites:** existing files are only replaced when Claude explicitly asks to overwrite. Edits keep the file's line endings and encoding.
 - **Hidden from Claude:** `.obsidian` (plugin settings can hold API keys), `.git`, `.ssh`, MEGA's `.debris`, password databases (`*.kdbx`) and key files. Edit `deny_folders` and `deny_files` in `config.json` to change this.
 - **Nothing outside your two folders:** no commands, and symlink or `..` tricks are blocked.
-- **No clicks on your screen:** linking a cloud session to the PC is still your decision.
-- **Everything is logged:** every tool call goes to `logs\bridge.log`.
+- **No clicks outside Chrome:** the Chrome tools click and type only inside Chrome, through the Claude in Chrome extension and its own site permissions. Nothing else on the screen is touched, and linking a cloud session to the PC is still your decision.
+- **No file uploads from the PC to websites:** Claude in Chrome's `file_upload` is blocked (also inside `browser_batch`), since it could send any file on the PC to a web page.
+- **Everything is logged:** every tool call goes to `logs\bridge.log`. For Chrome, the log keeps URLs and actions but not the text Claude typed.
 
 ## Install (about 10 minutes)
 
@@ -51,11 +53,30 @@ In Claude: **Settings > Connectors > Add custom connector**.
 - **Request header:** `Authorization: Bearer <token>`
 - **Fallback:** if the dialog has nowhere to put a header, use the URL with the secret inside it: `https://<your-pc>.<tailnet>.ts.net/k/<token>/mcp`
 
-Then, in the connector's tool permissions, consider setting `write_text`, `edit_text`, `append_text`, `create_upload_link`, `start_app` and `quit_app` to ask before running.
+Then, in the connector's tool permissions, consider setting `write_text`, `edit_text`, `append_text`, `create_upload_link`, `start_app` and `quit_app` to ask before running. The Chrome tools that only read pages are marked read-only; the ones that click, type, navigate or run scripts (`computer`, `form_input`, `navigate`, `javascript_tool`, `browser_batch`...) are not, so you can set those to ask too.
 
 **Download and upload links:** Claude's cloud workspace has a network allowlist. Add your PC's Funnel name (`<your-pc>.<tailnet>.ts.net`) to it, the same place you added MEGA. Without it, everything else still works; only the links won't.
 
-## Claude in Chrome / linking a session to the PC
+## Claude in Chrome from any chat
+
+The bridge runs the Claude in Chrome server that ships with **Claude Code** (`claude --claude-in-chrome-mcp`) and passes its browser tools through to the connector. So a chat started on your phone can browse in Chrome on this PC without being linked to the computer, and without the Claude desktop app.
+
+**One-time setup on this PC:**
+
+1. Install Claude Code for your Windows user, if it isn't already (`claude --version` in a terminal shows it). The bridge looks for it in `%USERPROFILE%\.local\bin\claude.exe`, on PATH, and in npm's folder. To point at it yourself, set `"chrome": {"claude_path": "C:\\path\\to\\claude.exe"}` in `config.json`.
+2. Sign in: run `claude`, then `/login`, with the **same claude.ai account** as the Chrome extension.
+3. In the same Claude Code session, run `/chrome` and turn it on once. This installs Claude Code's link to the extension. Pick this PC's browser if it asks.
+4. `bridge.cmd restart`, then `bridge.cmd test` or the self-test. `chrome_status` should say *connected*.
+
+**Using it:** just ask, for example "Open my Amazon orders in Chrome on my laptop". Claude starts Chrome with `start_app` if it isn't running. If several browsers are connected to your account, it uses the one on this PC; `list_connected_browsers` and `select_browser` switch between them, and the choice is remembered.
+
+**Site permissions:** by default the Claude in Chrome extension's own site settings apply. If a site isn't allowed there, the extension asks in Chrome on the PC, which you can't answer from your phone. Either allow the sites you use in the extension's settings, or set `"chrome": {"permission_mode": "skip_all_permission_checks"}` in `config.json` so it never asks (this lets Claude act on any site). `ask` and `follow_a_plan` are the other values Claude Code accepts.
+
+**Other settings** (all under `"chrome"` in `config.json`): `"enabled": false` turns the Chrome tools off; `"device_id"` picks a browser by its deviceId from `list_connected_browsers`; `"call_timeout_seconds"` (default 180).
+
+**If it doesn't work:** ask Claude to run `chrome_status` (it can also restart the connection with `restart=true`), or check `logs\chrome-mcp.log`. Claude Code and the extension must be signed in to the same account, and Chrome must be running with the extension.
+
+## Linking a session to the PC
 
 The Claude desktop app only gives remote access while it's **open**. So leave it closed, and ask Claude to start it when you need it:
 

@@ -1,5 +1,6 @@
 """Claude Bridge: a small MCP server that gives Claude scoped access to chosen
-folders on this PC, plus start/quit control of the Claude desktop app.
+folders on this PC, start/quit control of a few desktop apps, and Claude in
+Chrome on this PC (through Claude Code's own Chrome integration).
 
 Exposed to Claude as a custom connector via Tailscale Funnel. Every request
 must carry the secret token (Authorization: Bearer <token>, or the /k/<token>/
@@ -19,8 +20,10 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -28,14 +31,16 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -472,6 +477,248 @@ def _background_loop() -> None:
         time.sleep(max(1, every) * 60)
 
 
+# ---------------------------------------------------------------- Claude in Chrome (through Claude Code)
+#
+# Claude Code ships the Claude in Chrome MCP server that it normally starts for itself
+# (`claude --claude-in-chrome-mcp`, stdio). The bridge runs it as a child process, signed in with
+# Claude Code's own login, and passes its browser tools through. So any chat with this connector can
+# use Chrome on this PC, including one started on a phone that isn't linked to the computer.
+# The child lives in its own thread and event loop, so it isn't tied to any one HTTP request.
+
+CHROME = {
+    "enabled": True,
+    "claude_path": "",          # Claude Code's CLI; found automatically when empty
+    "permission_mode": "",      # "" = the extension's own site permissions; or ask / skip_all_permission_checks / follow_a_plan
+    "device_id": "",            # preferred browser (deviceId from list_connected_browsers); else Claude Code's saved choice
+    "call_timeout_seconds": 180,
+    **(CFG.get("chrome") or {}),
+}
+CHROME_PERMISSION_MODES = ("ask", "skip_all_permission_checks", "follow_a_plan")
+# file_upload would hand any file on this PC to a web page, outside the shared folders and deny lists.
+CHROME_BLOCKED = {"file_upload"}
+CHROME_READ_ONLY = {"read_page", "find", "get_page_text", "read_console_messages", "read_network_requests",
+                    "list_connected_browsers"}
+CHROME_CACHE = BASE_DIR / "chrome_tools.json"  # last tool list, so tools/list is instant while the child starts
+
+
+def find_claude_code() -> str:
+    """Path to Claude Code's CLI (not the desktop app, whose exe is also claude.exe), or ''."""
+    want = str(CHROME.get("claude_path") or "").strip()
+    if want:
+        return want if Path(want).expanduser().is_file() else ""
+    cands = [Path.home() / ".local" / "bin" / ("claude.exe" if IS_WINDOWS else "claude")]
+    found = shutil.which("claude")
+    if found:
+        cands.append(Path(found))
+    if IS_WINDOWS:
+        cands.append(Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd")
+    for c in cands:
+        low = str(c).lower()
+        if any(m in low for m in CLAUDE_MATCH) or "\\microsoft\\windowsapps\\" in low:
+            continue  # the desktop app or its Store alias
+        if c.is_file():
+            return str(c)
+    return ""
+
+
+def _err(e: BaseException) -> str:
+    """One readable line, unwrapping anyio's exception groups."""
+    while isinstance(e, BaseExceptionGroup) and e.exceptions:
+        e = e.exceptions[0]
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
+def _chrome_audit_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Log what Claude did in Chrome, but not what it typed (form values can be personal)."""
+    out: dict[str, Any] = {}
+    for k, v in (args or {}).items():
+        if k in ("text", "value") and isinstance(v, str):
+            out[k] = f"<{len(v)} chars>"
+        elif k == "actions" and isinstance(v, list):
+            out[k] = [{"name": a.get("name"), **_chrome_audit_args(a.get("input") or {})} if isinstance(a, dict) else "?" for a in v]
+        else:
+            out[k] = v
+    return out
+
+
+class ChromeLink:
+    def __init__(self) -> None:
+        self.tools: dict[str, Tool] = {}
+        self.state = "off" if not CHROME.get("enabled", True) else "not started"
+        self.error = ""
+        self.cli = ""
+        self.since = 0.0
+        self.started_at = 0.0
+        self._session: ClientSession | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._kick: asyncio.Event | None = None
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+        if CHROME.get("enabled", True):
+            self._load_cache()
+
+    # -- lifecycle (runs in the bridge-chrome thread)
+
+    def start(self) -> None:
+        if not CHROME.get("enabled", True) or self._thread:
+            return
+        self.started_at = time.time()
+        self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="bridge-chrome", daemon=True)
+        self._thread.start()
+
+    async def _run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._kick = asyncio.Event()
+        delay = 5
+        while True:
+            began = time.time()
+            try:
+                await self._connect_once()
+                delay = 1  # a requested restart
+            except Exception as e:  # noqa: BLE001 - the child failed to start, or died
+                self.error = _err(e)
+                log.warning("chrome: link down: %s", self.error)
+            self._session = None
+            self._ready.clear()
+            if self.state == "connected":
+                self.state = "reconnecting"
+            if time.time() - began > 300:
+                delay = 5
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
+    async def _connect_once(self) -> None:
+        if self._kick:
+            self._kick.clear()  # a restart asked for while the last connection was already going down
+        self.cli = find_claude_code()
+        if not self.cli:
+            self.state = "Claude Code not found"
+            raise RuntimeError("Claude Code (the claude CLI) isn't installed for this Windows user")
+        env = dict(os.environ)
+        mode = str(CHROME.get("permission_mode") or "").strip()
+        if mode in CHROME_PERMISSION_MODES:
+            env["CLAUDE_CHROME_PERMISSION_MODE"] = mode
+        if CHROME.get("device_id"):
+            env["CLAUDE_CHROME_PAIRED_DEVICE_ID"] = str(CHROME["device_id"])
+        params = StdioServerParameters(command=self.cli, args=["--claude-in-chrome-mcp"], env=env, cwd=str(BASE_DIR))
+        self.state = "starting"
+        err_path = LOG_DIR / "chrome-mcp.log"
+        fresh = err_path.exists() and err_path.stat().st_size > 5_000_000
+        with open(err_path, "w" if fresh else "a", encoding="utf-8", errors="replace") as errlog:
+            errlog.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} starting {self.cli} --claude-in-chrome-mcp\n")
+            errlog.flush()
+            async with stdio_client(params, errlog=errlog) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), 60)
+                    listed = (await asyncio.wait_for(session.list_tools(), 30)).tools
+                    self.tools = {t.name: t for t in listed if t.name not in CHROME_BLOCKED}
+                    self._save_cache()
+                    self._session, self.error, self.state, self.since = session, "", "connected", time.time()
+                    self._ready.set()
+                    log.info("chrome: Claude Code's Chrome server is up (%s), %d tools", self.cli, len(self.tools))
+                    while True:  # stay up; ping so a dead child is noticed
+                        try:
+                            await asyncio.wait_for(self._kick.wait(), 10)
+                            self._kick.clear()
+                            log.info("chrome: restart requested")
+                            return
+                        except TimeoutError:
+                            pass
+                        await asyncio.wait_for(session.send_ping(), 20)
+
+    def restart(self) -> None:
+        if self._loop and self._kick:
+            self._loop.call_soon_threadsafe(self._kick.set)
+
+    def _load_cache(self) -> None:
+        try:
+            for t in json.loads(CHROME_CACHE.read_text(encoding="utf-8")):
+                tool = Tool.model_validate(t)
+                if tool.name not in CHROME_BLOCKED:
+                    self.tools[tool.name] = tool
+        except (OSError, ValueError):
+            pass
+
+    def _save_cache(self) -> None:
+        try:
+            data = [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in self.tools.values()]
+            CHROME_CACHE.write_text(json.dumps(data), encoding="utf-8")
+        except (OSError, ValueError) as e:
+            log.warning("chrome: couldn't cache the tool list: %s", e)
+
+    # -- used by the MCP server (runs in uvicorn's event loop)
+
+    async def tool_list(self) -> list[Tool]:
+        if not CHROME.get("enabled", True):
+            return []
+        if self.state == "starting" or (self.state == "not started" and self._thread):
+            await asyncio.to_thread(self._ready.wait, 8)  # the bridge just started
+        out = []
+        for t in self.tools.values():
+            ann = ToolAnnotations(title=t.title or None, read_only_hint=t.name in CHROME_READ_ONLY,
+                                  destructive_hint=False, open_world_hint=True)
+            out.append(t.model_copy(update={"annotations": ann}))
+        return out
+
+    def handles(self, name: str) -> bool:
+        return CHROME.get("enabled", True) and (name in self.tools or name in CHROME_BLOCKED)
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        if name in CHROME_BLOCKED or (name == "browser_batch" and any(
+                isinstance(a, dict) and a.get("name") in CHROME_BLOCKED for a in (arguments.get("actions") or []))):
+            raise BridgeError("file_upload isn't available through the bridge: it could send any file on the PC to a "
+                              "web page. Ask Raph to pick the file in the browser himself.")
+        audit(f"chrome.{name}", **_chrome_audit_args(arguments))
+        timeout = float(CHROME.get("call_timeout_seconds", 180))
+        for attempt in (1, 2):
+            if not self._ready.is_set() and self._thread and (attempt == 2 or self.state in ("not started", "starting", "reconnecting")):
+                await asyncio.to_thread(self._ready.wait, 20)
+            session, loop = self._session, self._loop
+            if session is None or loop is None:
+                raise BridgeError(f"Claude in Chrome isn't reachable through the bridge right now ({self.error or self.state}). "
+                                  "Call chrome_status for details.")
+            sent = time.time()
+            fut = asyncio.run_coroutine_threadsafe(session.call_tool(name, arguments, read_timeout_seconds=timeout), loop)
+            try:
+                return await asyncio.wrap_future(fut)
+            except Exception as e:  # noqa: BLE001 - a transport failure or timeout, not a tool error
+                log.warning("chrome: %s failed: %s", name, _err(e))
+                # The child died between pings: restart it. Retry only if the call failed at once,
+                # i.e. it never reached the browser, so nothing can happen twice.
+                if "closed" in _err(e).lower() and self._session is session:
+                    self._ready.clear()
+                    self.restart()
+                    if attempt == 1 and time.time() - sent < 1:
+                        await asyncio.sleep(1)
+                        continue
+                raise BridgeError(f"The Chrome call didn't complete ({_err(e)}). Call chrome_status, then retry.") from None
+        raise BridgeError("The Chrome call didn't complete. Call chrome_status, then retry.")
+
+    def describe(self) -> str:
+        if not CHROME.get("enabled", True):
+            return "Chrome tools: turned off in config.json (\"chrome\": {\"enabled\": false})"
+        if self.state == "connected":
+            head = f"Chrome tools: connected since {fmt_time(self.since)} ({len(self.tools)} tools)"
+        else:
+            head = f"Chrome tools: NOT connected ({self.state}{': ' + self.error if self.error else ''})"
+        mode = str(CHROME.get("permission_mode") or "").strip()
+        lines = [
+            head,
+            f"Claude Code: {self.cli or find_claude_code() or 'not found'}",
+            "Site permissions: " + (mode if mode in CHROME_PERMISSION_MODES else "the extension's own settings"),
+        ]
+        chrome_app = APPS.get("chrome")
+        if chrome_app and IS_WINDOWS:
+            lines.append(f"Chrome: {app_state(chrome_app)[1]}")
+        if self.state != "connected":
+            lines.append("To fix: Claude Code must be installed on the PC and signed in (run `claude`, then /login) with the same "
+                         "claude.ai account as the Chrome extension. Details are in logs\\chrome-mcp.log on the PC.")
+        return "\n".join(lines)
+
+
+CHROME_LINK = ChromeLink()
+
+
 # ---------------------------------------------------------------- MCP server
 
 INSTRUCTIONS = f"""Claude Bridge v{VERSION}: access to folders on Raph's PC.
@@ -480,10 +727,29 @@ Backups is his MEGA folder and Notes is his Obsidian vault: changes there sync t
 so change only what was asked. Prefer edit_text/append_text over rewriting whole notes. Nothing can be deleted or moved;
 the bridge keeps the previous version of anything it changes. Write tools also make sure MEGA/Obsidian are running.
 For big or binary files (docx, xlsx, zip...), use create_download_link and fetch the URL from your own workspace.
-app_status / start_app / quit_app manage MEGA, Obsidian, Chrome and the Claude desktop app. For Claude in Chrome:
-start_app('Chrome') then start_app('Claude'); quit Claude (and Chrome if you started it) when done."""
+app_status / start_app / quit_app manage MEGA, Obsidian, Chrome and the Claude desktop app.
+Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer, read_page, find, get_page_text...) are
+Claude in Chrome, run through Claude Code on the PC, so they work from any chat, linked or not, without the Claude app.
+Start with tabs_context_mcp(createIfEmpty=true) and work in your own tab. If a call says Chrome or the extension isn't
+connected, call start_app('Chrome'), wait a few seconds and retry; chrome_status shows what's wrong. If several browsers
+are listed, the one on this PC is the one list_connected_browsers marks as on this computer. file_upload is not available."""
 
-mcp = MCPServer(name="Claude Bridge", instructions=INSTRUCTIONS, version=VERSION)
+
+class BridgeServer(MCPServer):
+    """MCPServer plus the Chrome tools passed through from Claude Code's Claude in Chrome server."""
+
+    async def list_tools(self) -> list[Tool]:
+        own = await super().list_tools()
+        names = {t.name for t in own}
+        return own + [t for t in await CHROME_LINK.tool_list() if t.name not in names]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
+        if self._tool_manager.get_tool(name) is None and CHROME_LINK.handles(name):
+            return await CHROME_LINK.call(name, arguments or {})
+        return await super().call_tool(name, arguments, context)
+
+
+mcp = BridgeServer(name="Claude Bridge", instructions=INSTRUCTIONS, version=VERSION)
 RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 WR = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
@@ -827,6 +1093,19 @@ async def quit_app(name: str) -> str:
     return f"{app.name} closed." if not _procs(app) else f"Some {app.name} processes are still running; check app_status."
 
 
+@mcp.tool(annotations=RO)
+async def chrome_status(restart: bool = False) -> str:
+    """Is Claude in Chrome on the PC reachable through the bridge? Shows the link state, Claude Code's path and the
+    last error. restart=True restarts the bridge's connection to Claude Code's Chrome server (try it if Chrome
+    calls keep failing while Chrome is running)."""
+    audit("chrome_status", restart=restart)
+    if restart and CHROME_LINK.state not in ("off",):
+        CHROME_LINK.restart()
+        await asyncio.sleep(2)
+        await asyncio.to_thread(CHROME_LINK._ready.wait, 20)
+    return CHROME_LINK.describe()
+
+
 # ---------------------------------------------------------------- HTTP routes (links, health)
 
 
@@ -947,9 +1226,9 @@ def main():
     for r in ROOTS.values():
         if not r.path.exists():
             log.warning("folder %s does not exist: %s", r.name, r.path)
-    import threading
 
     threading.Thread(target=_background_loop, name="bridge-background", daemon=True).start()
+    CHROME_LINK.start()
     uvicorn.run(build_app(), host="127.0.0.1", port=port, log_config=None, access_log=False,
                 proxy_headers=True, forwarded_allow_ips="127.0.0.1")
 

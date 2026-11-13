@@ -30,6 +30,9 @@ re-detects the apps, restarts the task, and leaves Funnel as is. Then run the se
 
 - Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no delete
   or move tools, MEGA/Obsidian can't be quit, `.obsidian`/`.git`/keys hidden, history copy before every change. Don't add a shell or delete tool.
+- Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
+  Keep `file_upload` blocked, including inside `browser_batch`, and don't log the text Claude types. `chrome_status`
+  shows the link state; the child's stderr goes to `logs\chrome-mcp.log`.
 - Never paste the token into anything other than this machine's files or the chat with Raph.
 - Windows PowerShell 5.1 compatibility matters (no `&&`, `??`, ternaries); keep .ps1 files ASCII-only.
 - After changing `server.py`, restart with `bridge.cmd restart` and re-run the self-test.

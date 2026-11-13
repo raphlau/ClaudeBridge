@@ -1,8 +1,8 @@
 """Self-test for Claude Bridge. Run with the bridge's own Python:
     .venv\\Scripts\\python.exe selftest.py            (local, http://127.0.0.1:<port>)
     .venv\\Scripts\\python.exe selftest.py --public   (also through Tailscale Funnel)
-Read-only: it lists folders, searches, checks which apps (MEGA, Obsidian, Chrome, Claude) are running, and confirms
-that requests without the token are refused. It changes nothing.
+Read-only: it lists folders, searches, checks which apps (MEGA, Obsidian, Chrome, Claude) are running, reports whether
+the Chrome tools are connected, and confirms that requests without the token are refused. It changes nothing.
 """
 
 import asyncio
@@ -42,6 +42,10 @@ async def check(base: str) -> bool:
                     res = await s.call_tool(name, args)
                     ok &= not res.is_error
                     print(f"\n{name}{' [ERROR]' if res.is_error else ''}:\n{text_of(res)}")
+                # Chrome is optional (needs Claude Code signed in), so it's reported but doesn't fail the test.
+                res = await s.call_tool("chrome_status", {})
+                n_chrome = len([t for t in tools if t in ("navigate", "computer", "read_page", "tabs_context_mcp")])
+                print(f"\nchrome_status (browser tools listed: {'yes' if n_chrome == 4 else 'no'}):\n{text_of(res)}")
                 for root in [r["name"] for r in CFG["roots"]]:
                     res = await s.call_tool("list_dir", {"path": root, "max_entries": 8})
                     ok &= not res.is_error
