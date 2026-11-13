@@ -29,9 +29,9 @@ async def check(base: str) -> bool:
         r = await hc.get(f"{base}/healthz")
         print(f"healthz: {r.status_code} {r.text!r}")
         r = await hc.post(f"{base}/mcp", json={})
-        refused = r.status_code == 401
+        refused = r.status_code == 404 and not r.content  # without the token: an empty 404, nothing else
         ok &= refused
-        print(f"no token refused: {'yes' if refused else 'NO (status %d)' % r.status_code}")
+        print(f"no token refused: {'yes (empty 404)' if refused else 'NO (status %d)' % r.status_code}")
     async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}, timeout=60) as hc:
         async with streamable_http_client(f"{base}/mcp", http_client=hc) as streams:
             async with ClientSession(streams[0], streams[1]) as s:

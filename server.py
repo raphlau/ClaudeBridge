@@ -39,9 +39,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -1402,8 +1402,7 @@ async def healthz(request: Request):
 async def download(request: Request):
     info = LINKS.get(request.path_params["token"])
     if not info or info["kind"] != "download" or info["expires"] < time.time() or not info["path"].is_file():
-        GUARD.bad_attempt("download link", _client(request.scope))
-        return PlainTextResponse("Link not found or expired", status_code=404)
+        return _link_miss(request)
     log.info("download %s", info["display"])
     return FileResponse(info["path"], filename=info["path"].name,
                         media_type=mimetypes.guess_type(info["path"].name)[0] or "application/octet-stream")
@@ -1414,8 +1413,7 @@ async def upload(request: Request):
     tok = request.path_params["token"]
     info = LINKS.get(tok)
     if not info or info["kind"] != "upload" or info["expires"] < time.time():
-        GUARD.bad_attempt("upload link", _client(request.scope))
-        return PlainTextResponse("Link not found or expired", status_code=404)
+        return _link_miss(request)
     LINKS.pop(tok, None)  # one use
     dest: Path = info["path"]
     if dest.exists() and not info["overwrite"]:
@@ -1448,28 +1446,97 @@ async def upload(request: Request):
     return JSONResponse({"saved": info["display"], "bytes": size, "sync": sync})
 
 
-# ---------------------------------------------------------------- lockout and alerts
+# ---------------------------------------------------------------- sinkhole, lockout and alerts
 #
-# Internet scanners hit the public address all day without any token; those are only logged. A request that
-# presents a WRONG token (Bearer header, /k/ URL, or a one-time link) means someone is trying to get in: after
-# security.max_bad_tokens of those within security.window_minutes, the bridge locks itself (every request is
-# refused, even with the right token) for security.lockout_minutes, and alerts Raph.
+# Anything without the right token gets an empty 404, as if nothing were there (internet scanners hit the public
+# address all day). Per address: security.block_after_no_token requests without a token, or
+# security.block_after_wrong_token with a wrong one, within security.window_minutes get that address ignored for
+# security.block_hours. This PC, the tailnet, and any address that has shown the right token are never blocked, and
+# the right token always gets through a block.
+# Globally: security.max_bad_tokens wrong tokens (from addresses not yet blocked) within the window lock the whole
+# bridge, even for the right token, for security.lockout_minutes, and alert Raph.
+
+import ipaddress  # noqa: E402
 
 SECURITY = {"max_bad_tokens": 10, "window_minutes": 10, "lockout_minutes": 60, "alert_url": "",
+            "block_after_no_token": 5, "block_after_wrong_token": 3, "block_hours": 24,
             **(CFG.get("security") or {})}
-LOCK_FILE = BASE_DIR / "lockout.json"  # survives restarts; 'bridge.cmd unlock' removes it
+LOCK_FILE = BASE_DIR / "lockout.json"       # survives restarts; 'bridge.cmd unlock' removes it
+BLOCK_FILE = BASE_DIR / "blocked_ips.json"  # likewise
+TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
 
 def _client(scope: dict) -> str:
-    """Who sent it (Funnel passes the real address in X-Forwarded-For). Only a valid IP is ever used."""
-    import ipaddress
-
-    raw = dict(scope.get("headers") or []).get(b"x-forwarded-for", b"").decode("latin-1").split(",")[0].strip()
-    raw = raw or (scope.get("client") or ("", 0))[0]
+    """The sender's address. uvicorn takes it from Funnel's X-Forwarded-For (trusted only from 127.0.0.1, and
+    Tailscale doesn't pass on a forged one); a direct local request is 127.0.0.1."""
     try:
-        return str(ipaddress.ip_address(raw))
+        return str(ipaddress.ip_address((scope.get("client") or ("", 0))[0]))
     except ValueError:
         return "unknown"
+
+
+def _own_network(ip: str) -> bool:
+    """This PC, or a device on Raph's tailnet."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.is_loopback or any(a in n for n in TAILNET)
+
+
+class Blocker:
+    def __init__(self) -> None:
+        self.hits: dict[tuple[str, str], list[float]] = {}
+        self.blocked: dict[str, float] = {}   # address -> blocked until
+        self.trusted: dict[str, float] = {}   # address -> last time it showed the right token
+        self._lock = threading.Lock()
+        try:
+            now = time.time()
+            self.blocked = {ip: float(u) for ip, u in json.loads(BLOCK_FILE.read_text(encoding="utf-8")).items() if float(u) > now}
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def is_blocked(self, ip: str) -> bool:
+        return self.blocked.get(ip, 0) > time.time()
+
+    def trust(self, ip: str) -> None:
+        self.trusted[ip] = time.time()
+        if ip in self.blocked:
+            with self._lock:
+                self.blocked.pop(ip, None)
+                self._save()
+            log.info("unblocked %s: it showed the right token", ip)
+
+    def strike(self, ip: str, kind: str) -> None:
+        now = time.time()
+        if ip == "unknown" or _own_network(ip) or now - self.trusted.get(ip, 0) < 86400:
+            return
+        limit = max(2, int(SECURITY.get(f"block_after_{kind}", 5)))
+        window = float(SECURITY.get("window_minutes", 10)) * 60
+        with self._lock:
+            key = (ip, kind)
+            recent = [t for t in self.hits.get(key, []) if now - t < window] + [now]
+            self.hits[key] = recent
+            if len(self.hits) > 5000:  # forget quiet addresses
+                self.hits = {k: v for k, v in self.hits.items() if now - v[-1] < window}
+            if len(recent) < limit:
+                return
+            hours = max(1, int(SECURITY.get("block_hours", 24)))
+            self.blocked = {k: u for k, u in self.blocked.items() if u > now}
+            self.blocked[ip] = now + hours * 3600
+            self.hits.pop(key, None)
+            self._save()
+        log.warning("blocked %s for %d h (%d requests with %s in %d min)", ip, hours, limit,
+                    "no token" if kind == "no_token" else "a wrong token", window // 60)
+
+    def _save(self) -> None:
+        try:
+            BLOCK_FILE.write_text(json.dumps(self.blocked), encoding="utf-8")
+        except OSError as e:
+            log.warning("couldn't save the blocked addresses: %s", e)
+
+
+BLOCKER = Blocker()
 
 
 def send_alert(title: str, body: str) -> None:
@@ -1552,10 +1619,24 @@ async def _respond(send, status: int, body: bytes) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+async def _nothing(send) -> None:
+    """What anyone without the token gets: an empty 404, the same as an address with nothing behind it."""
+    await send({"type": "http.response.start", "status": 404, "headers": [(b"content-length", b"0")]})
+    await send({"type": "http.response.body", "body": b""})
+
+
+def _link_miss(request: Request) -> Response:
+    """An unknown or expired one-time link: counts as a wrong token."""
+    who = _client(request.scope)
+    GUARD.bad_attempt("link", who)
+    BLOCKER.strike(who, "wrong_token")
+    return Response(status_code=404)
+
+
 class TokenGate:
-    """Require the secret token on everything except /healthz and the one-time link routes (which carry their
-    own random token). Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL prefix. While locked
-    (see Guard), everything but /healthz is refused."""
+    """Require the secret token on everything except the one-time link routes (which carry their own random
+    token) and /healthz from this PC or the tailnet. Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL
+    prefix. Everything else gets an empty 404 (see Blocker); while locked (see Guard), even the right token gets 503."""
 
     LINK_PREFIXES = ("/dl/", "/ul/")
 
@@ -1567,20 +1648,12 @@ class TokenGate:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path: str = scope.get("path", "")
-        if path == "/healthz":
-            return await self.app(scope, receive, send)
-        if GUARD.locked():
-            await asyncio.sleep(1.0)
-            return await _respond(send, 503, json.dumps({"error": "Claude Bridge is locked after repeated wrong-token "
-                                  f"requests, until {fmt_time(GUARD.until)}. Unlock on the PC: bridge.cmd unlock"}).encode())
-        if path.startswith(self.LINK_PREFIXES):
-            return await self.app(scope, receive, send)
+        who = _client(scope)
         ok = presented = False
         if path.startswith("/k/"):
             presented = True
-            _, _, rest = path[3:].partition("/")
-            key = path[3:].split("/", 1)[0].encode()
-            if hmac.compare_digest(key, self.token):
+            key, _, rest = path[3:].partition("/")
+            if hmac.compare_digest(key.encode(), self.token):
                 ok = True
                 scope = dict(scope, path="/" + rest, raw_path=("/" + rest).encode())
         else:
@@ -1588,15 +1661,28 @@ class TokenGate:
             presented = bool(auth.strip())
             if auth[:7].lower() == b"bearer " and hmac.compare_digest(auth[7:].strip(), self.token):
                 ok = True
-        if not ok:
-            who = _client(scope)
-            if presented:
-                GUARD.bad_attempt("connector", who)
-            else:  # no token at all: internet background noise
-                log.info("rejected request to %s from %s", path[:40] if not path.startswith("/k/") else "/k/***", who)
+        if ok:
+            BLOCKER.trust(who)
+            if GUARD.locked():
+                await asyncio.sleep(1.0)
+                return await _respond(send, 503, json.dumps({"error": "Claude Bridge is locked after repeated wrong-token "
+                                      f"requests, until {fmt_time(GUARD.until)}. Unlock on the PC: bridge.cmd unlock"}).encode())
+            return await self.app(scope, receive, send)
+        if path == "/healthz" and _own_network(who):
+            return await self.app(scope, receive, send)
+        if BLOCKER.is_blocked(who) or GUARD.locked():
+            return await _nothing(send)
+        if path.startswith(self.LINK_PREFIXES) and not presented:
+            return await self.app(scope, receive, send)  # the link routes check their own token
+        if presented:
+            GUARD.bad_attempt("connector", who)
+            BLOCKER.strike(who, "wrong_token")
             await asyncio.sleep(1.0)
-            return await _respond(send, 401, b'{"error":"unauthorized"}')
-        return await self.app(scope, receive, send)
+        else:
+            log.info("no token: %s from %s", path[:40], who)
+            if not path.startswith("/.well-known/"):  # Claude's connector checks these for OAuth; never count them
+                BLOCKER.strike(who, "no_token")
+        return await _nothing(send)
 
 
 def build_app():

@@ -11,3 +11,4 @@ update_request.json
 previous/
 dist/
 lockout.json
+blocked_ips.json

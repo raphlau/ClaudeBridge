@@ -29,7 +29,7 @@ if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Leng
 $statePath = Join-Path $Dir 'update_state.json'
 $reqPath = Join-Path $Dir 'update_request.json'
 # Files in the install folder that belong to this PC, not to a release
-$localFiles = @('config.json', 'connector.txt', 'chrome_tools.json', 'chrome_state.json', 'update_state.json', 'update_request.json', 'lockout.json')
+$localFiles = @('config.json', 'connector.txt', 'chrome_tools.json', 'chrome_state.json', 'update_state.json', 'update_request.json', 'lockout.json', 'blocked_ips.json')
 
 function Log([string]$msg) {
     Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" -Encoding UTF8

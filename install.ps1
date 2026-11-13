@@ -305,12 +305,11 @@ $summary = @"
 Claude Bridge is installed.
 
 Add it to Claude (Settings > Connectors > Add custom connector):
-  Name: Home PC
-  URL:  https://$dns/mcp
-  Request header:  Authorization: Bearer $token
+  Name: Bridge ($env:COMPUTERNAME)
+  URL:  https://$dns/k/$token/mcp
+This URL contains the secret: treat it like a password. Each PC has its own.
 
-If there's no place for a request header, use this URL instead (it contains the secret, treat it like a password):
-  https://$dns/k/$token/mcp
+(If a tool lets you set request headers instead: https://$dns/mcp with  Authorization: Bearer $token)
 
 For download/upload links to work from Claude's cloud workspace, add this to Claude's allowed domains:
   $dns

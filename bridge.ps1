@@ -7,7 +7,7 @@
     .\bridge.cmd restart       restart the server (after editing config.json)
     .\bridge.cmd logs          last 60 log lines (every tool call is logged)
     .\bridge.cmd update        install the latest release now (it also happens by itself once a day)
-    .\bridge.cmd unlock        lift a lockout (after repeated wrong-token requests) before it ends by itself
+    .\bridge.cmd unlock        lift a lockout and clear blocked addresses before they expire
     .\bridge.cmd test          run the server in this window to see startup errors
     .\bridge.cmd rotate-token  make a new secret (update the connector in Claude afterwards)
     .\bridge.cmd uninstall     remove the tasks and the Funnel (leaves this folder for you to delete)
@@ -53,8 +53,27 @@ switch ($Command) {
         } elseif (-not (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue)) {
             Write-Host "Last update:   no update task (re-run the installer to set it up)"
         }
+        $blk = Join-Path $Dir 'blocked_ips.json'
+        if (Test-Path -LiteralPath $blk) {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $n = @((Get-Content -LiteralPath $blk -Raw | ConvertFrom-Json).PSObject.Properties | Where-Object { [double]$_.Value -gt $now }).Count
+            if ($n) { Write-Host "Blocked:       $n internet address(es) ignored for a while (scanners or wrong tokens)" }
+        }
         Write-Host "Local server:  $(if (Health "$target/healthz") { 'OK' } else { 'NOT responding' })"
-        Write-Host "Public URL:    $($cfg.public_url)  ->  $(if (Health "$($cfg.public_url)/healthz") { 'OK' } else { 'NOT reachable' })"
+        # Check the way Claude's servers connect: public DNS (not Tailscale's), then HTTPS over the internet.
+        # On this PC the name resolves inside the tailnet, which would hide a Funnel problem.
+        $hostName = ([Uri]$cfg.public_url).Host
+        $pub = 'NOT reachable'
+        try {
+            $dns = Invoke-RestMethod "https://cloudflare-dns.com/dns-query?name=$hostName&type=A" -Headers @{ Accept = 'application/dns-json' } -UseBasicParsing -TimeoutSec 10
+            $ip = @($dns.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data }) | Select-Object -First 1
+            if (-not $ip) { $pub = 'NOT reachable: no public DNS name yet (Funnel off, or still appearing)' }
+            else {
+                $body = & curl.exe -s -m 15 --resolve "${hostName}:443:$ip" "https://$hostName/k/$($cfg.token)/healthz"
+                if ($body -eq 'ok') { $pub = 'OK' } else { $pub = "NOT reachable through Funnel ($ip)" }
+            }
+        } catch { $pub = "couldn't check ($($_.Exception.Message))" }
+        Write-Host "From internet: $pub"
         Write-Host "Claude app:    $(if (Get-Process -Name claude -ErrorAction SilentlyContinue) { 'running' } else { 'not running' })"
         Write-Host "`nFunnel:"; & $ts funnel status
     }
@@ -76,6 +95,7 @@ switch ($Command) {
     'logs' { Get-Content -LiteralPath (Join-Path $Dir 'logs\bridge.log') -Tail 60 }
     'unlock' {
         Remove-Item -LiteralPath (Join-Path $Dir 'lockout.json') -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $Dir 'blocked_ips.json') -Force -ErrorAction SilentlyContinue
         Stop-Server; Start-Sleep -Seconds 1; Start-ScheduledTask -TaskName $TaskName; Start-Sleep -Seconds 3
         Write-Host "Unlocked. Local server: $(if (Health "$target/healthz") { 'OK' } else { 'not responding; try .\bridge.cmd test' })"
         Write-Host "If those wrong tokens weren't yours, also run .\bridge.cmd rotate-token." -ForegroundColor Yellow

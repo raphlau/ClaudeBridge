@@ -26,8 +26,8 @@ At the end it shows the connector details, also saved in `%LOCALAPPDATA%\ClaudeB
 
 **Settings > Connectors > Add custom connector**:
 
-- **URL:** `https://<your-pc>.<tailnet>.ts.net/mcp`
-- **Request header:** `Authorization: Bearer <token>`. If there's nowhere to put a header, use `https://<your-pc>.<tailnet>.ts.net/k/<token>/mcp`; that URL contains the secret.
+- **URL:** `https://<your-pc>.<tailnet>.ts.net/k/<token>/mcp`, the first URL in `connector.txt`. It contains the secret, and each PC has its own. Without the `/k/<token>` part, Claude tries an OAuth sign-in and reports that it can't connect.
+- **Header instead:** if a client lets you set request headers, `https://<your-pc>.<tailnet>.ts.net/mcp` with `Authorization: Bearer <token>` also works.
 
 In the connector's tool permissions, consider "ask before running" for the tools that change things: `write_text`, `edit_text`, `append_text`, `create_upload_link`, `start_app`, `quit_app`, and the Chrome tools that click, type, navigate or run scripts (`computer`, `form_input`, `navigate`, `javascript_tool`, `browser_batch`).
 
@@ -36,7 +36,7 @@ In the connector's tool permissions, consider "ask before running" for the tools
 ## What keeps it safe
 
 - **The token:** 256 bits from Windows' cryptographic random generator, made on your PC by the installer. It's stored in `config.json`, readable only by you. It's checked on every request, in constant time.
-- **Lockout:** if requests with a **wrong** token keep arriving, the bridge locks itself and alerts you (see [Lockout and alerts](#lockout-and-alerts)). Internet scanners that send no token are just logged.
+- **Nothing to see without the token:** every request without the right token gets an empty 404, as if there were nothing there. Addresses that keep trying get ignored, and repeated wrong tokens lock the bridge and alert you (see [Blocking, lockout and alerts](#blocking-lockout-and-alerts)).
 - **Only your two folders:** there are no commands or shell. Paths outside the folders, `..`, symlink tricks and odd Windows names (`:` streams, `CON`, trailing dots) are refused.
 - **Nothing is deleted or moved,** and before any change the previous version is copied to `%LOCALAPPDATA%\ClaudeBridge\history` (kept 30 days).
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
@@ -47,9 +47,16 @@ In the connector's tool permissions, consider "ask before running" for the tools
 
 What remains: anyone with the token can do what Claude can. That includes acting in Chrome with your signed-in accounts, so treat the token like a password. Anyone who can publish a release here (your GitHub account) can update the code on your PC, so keep 2FA on.
 
-## Lockout and alerts
+## Blocking, lockout and alerts
 
-**When it locks:** after 10 requests with a wrong token within 10 minutes (wrong connector token, or a wrong download/upload link), the bridge refuses **everything**, the right token included, for 60 minutes.
+**Without the token:** the public address answers every request with an empty 404, including `/healthz`. `/healthz` answers only on this PC and your tailnet. Tailscale still completes the HTTPS handshake; nothing on the PC can prevent that.
+
+**Blocking addresses:** an internet address that sends 5 requests without a token, or 3 with a wrong one, within 10 minutes is ignored for 24 hours, and its attempts stop counting toward the lockout below. So a single attacker can't lock you out. It never blocks:
+- this PC or your tailnet;
+- Claude's OAuth checks (`/.well-known/...`);
+- an address that has shown the right token. The right token always gets through a block.
+
+**Locking:** after 10 wrong tokens within 10 minutes (connector or download/upload links) from addresses not yet blocked, the bridge refuses **everything**, the right token included, for 60 minutes.
 
 **Alerts:** it shows a notification on the PC. For a push to your phone as well, install the [ntfy](https://ntfy.sh) app, subscribe to a long random topic name, and add it to `config.json`:
 
@@ -59,7 +66,7 @@ What remains: anyone with the token can do what Claude can. That includes acting
 
 **Ending it early:** `bridge.cmd unlock`. If the wrong tokens weren't yours, also run `bridge.cmd rotate-token` and update the connector in Claude.
 
-**Settings** (under `"security"`): `max_bad_tokens`, `window_minutes`, `lockout_minutes`.
+**Settings** (under `"security"`): `block_after_no_token`, `block_after_wrong_token`, `block_hours`, `max_bad_tokens`, `window_minutes`, `lockout_minutes`. `bridge.cmd unlock` also clears blocked addresses.
 
 ## Chrome on the PC
 
@@ -87,12 +94,12 @@ Run these in `%LOCALAPPDATA%\ClaudeBridge`:
 
 | `bridge.cmd ...` | |
 |---|---|
-| `status` | version, lockout, last update, local and public health |
+| `status` | version, lockout, blocked addresses, last update, and whether it answers locally and from the internet |
 | `off` / `on` | kill switch: stop the server and take it off the internet, and back |
 | `restart` | after editing `config.json` |
 | `logs` | last 60 log lines |
 | `update` | install the latest release now |
-| `unlock` | end a lockout early |
+| `unlock` | end a lockout and clear blocked addresses early |
 | `rotate-token` | new secret; update the connector in Claude afterwards |
 | `test` | run in the foreground to see startup errors |
 | `uninstall` | remove the tasks and the Funnel, then delete the folder yourself |
