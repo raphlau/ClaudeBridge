@@ -75,8 +75,15 @@ switch ($Command) {
         } catch { $pub = "couldn't check ($($_.Exception.Message))" }
         Write-Host "From internet: $pub"
         foreach ($r in @($cfg.roots)) {
-            Write-Host ("Folder:        {0} -> {1} ({2}{3})" -f $r.name, $r.path, $(if ($r.mode -eq 'write') { 'writable' } else { 'read-only' }),
-                $(if (Test-Path -LiteralPath $r.path) { '' } else { ', MISSING' }))
+            # Same rule as the server: the nearest folder (upwards) with .obsidian, or .megaignore/.debris
+            $sync = ''; $p = $r.path
+            while ($p -and -not $sync) {
+                if (Test-Path -LiteralPath (Join-Path $p '.obsidian')) { $sync = 'Obsidian' }
+                elseif ((Test-Path -LiteralPath (Join-Path $p '.megaignore')) -or (Test-Path -LiteralPath (Join-Path $p '.debris'))) { $sync = 'MEGA' }
+                $p = Split-Path $p -Parent
+            }
+            Write-Host ("Folder:        {0} -> {1} ({2})" -f $r.name, $r.path,
+                $(if (-not (Test-Path -LiteralPath $r.path)) { 'MISSING' } elseif ($sync) { "synced by $sync" } else { 'no sync app found' }))
         }
         Write-Host "`nFunnel:"; & $ts funnel status
     }

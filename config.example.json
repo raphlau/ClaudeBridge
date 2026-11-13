@@ -5,40 +5,11 @@
   "roots": [
     {
       "name": "Files",
-      "path": "C:\\Users\\you\\Documents\\MEGA\\Important Documents",
-      "mode": "write",
-      "sync_app": "MEGA"
+      "path": "C:\\Users\\you\\Documents\\MEGA\\Important Documents"
     },
     {
       "name": "Notes",
-      "path": "C:\\Users\\you\\Documents\\Obsidian\\Vault",
-      "mode": "write",
-      "sync_app": "Obsidian"
-    }
-  ],
-  "apps": [
-    {
-      "name": "MEGA",
-      "process": "MEGAsync.exe",
-      "launch": [
-        "C:\\Users\\you\\AppData\\Local\\MEGAsync\\MEGAsync.exe"
-      ]
-    },
-    {
-      "name": "Obsidian",
-      "process": "Obsidian.exe",
-      "launch": "obsidian://open?vault=Vault",
-      "vault": "C:\\Users\\you\\Documents\\Obsidian\\Vault"
-    },
-    {
-      "name": "Chrome",
-      "process": "chrome.exe",
-      "launch": [
-        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-      ],
-      "match": [
-        "\\google\\chrome\\"
-      ]
+      "path": "C:\\Users\\you\\Documents\\Obsidian\\Vault"
     }
   ],
   "history_days": 30,
@@ -65,7 +36,8 @@
   },
   "chrome": {
     "enabled": true,
-    "idle_minutes": 10
+    "idle_minutes": 10,
+    "profile": ""
   },
   "security": {
     "max_bad_tokens": 10,

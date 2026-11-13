@@ -128,7 +128,7 @@ The bridge runs the Claude in Chrome server that comes with **Claude Code**, and
 - **Which browser:** the one in use, or the one used last here, or the one Claude Code knows is on this PC. It never picks a browser on another computer by itself. If it can't tell, Claude asks you and calls `chrome_status(browser=...)`, and your answer is remembered.
 - **Site permissions:** the extension's own settings apply. If a site isn't allowed, the extension asks in Chrome on the PC, so allow the sites you use in the extension beforehand.
 
-**Settings** (under `"chrome"`): `enabled`, `idle_minutes`, `device_id`, `permission_mode`, `call_timeout_seconds`, `claude_path`.
+**Settings** (under `"chrome"`): `enabled`, `idle_minutes`, `profile` (a Chrome profile folder such as `"Profile 1"`, if Claude in Chrome is not in the default one), `device_id`, `permission_mode`, `call_timeout_seconds`, `claude_path`.
 
 If something's wrong, ask Claude to run `chrome_status`, or look at `logs\chrome-mcp.log`.
 
@@ -158,7 +158,7 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 ## Good to know
 
-- **Sync apps:** if Files is synced by MEGA or Notes is Obsidian, the bridge starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. Chrome is started whenever a Chrome tool needs it. It leaves them alone otherwise.
+- **Sync apps:** the bridge works out by itself which app syncs each folder: Obsidian if the folder is in a vault (`.obsidian`), MEGA if it's in a MEGA sync (`.megaignore` or `.debris`). It starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. Chrome is started whenever a Chrome tool needs it. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
 - **Restoring a file:** copies are in `history\<Files|Notes>\...\<file>.<date-time>`, or use your sync app's version history.
 - **Keeping it reachable:**
   - **Sleep:** set sleep to Never when plugged in, and closing the lid to "Do nothing".

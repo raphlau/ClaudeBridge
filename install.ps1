@@ -9,8 +9,7 @@
   Or from an unzipped release folder:
     powershell -ExecutionPolicy Bypass -File .\install.ps1
 
-  Re-run any time to update the code. Add -Reconfigure to choose folders again,
-  and -ChromeProfile 'Profile 1' if Claude in Chrome is in a non-default Chrome profile.
+  Re-run any time to update the code. Add -Reconfigure to choose folders again.
   -Unattended is used by update.ps1: no questions, and it needs an existing config.json.
 #>
 [CmdletBinding()]
@@ -18,7 +17,6 @@ param(
     [int]$Port = 8765,
     [string]$InstallDir = "$env:LOCALAPPDATA\ClaudeBridge",
     [switch]$Reconfigure,
-    [string]$ChromeProfile = '',   # e.g. 'Profile 1' if Claude in Chrome lives in a non-default Chrome profile
     [switch]$Unattended
 )
 
@@ -150,12 +148,6 @@ function Choose-Folder([string]$label, [string]$hint, [string[]]$candidates) {
         Write-Host "  That's not one of the options or an existing folder; try again." -ForegroundColor Yellow
     }
 }
-function Find-Exe([string]$procName, [string[]]$candidates) {
-    $p = Get-Process -Name $procName -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
-    if ($p) { return $p.Path }
-    foreach ($c in $candidates) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
-    return $null
-}
 
 $cfg = $null
 if (Test-Path $cfgPath) {
@@ -171,17 +163,9 @@ if ($cfg -and -not $Reconfigure) {
     Say "`nPick the two folders to share. Claude can read and add or change files there, but never delete or move anything."
     $roots = @()
     $f = Choose-Folder 'Files: your documents' 'Papers, scans, letters, office files... e.g. a synced "Important Documents" folder.' (Get-FileCandidates)
-    if ($f) {
-        $r = [ordered]@{ name = 'Files'; path = $f; mode = 'write' }
-        if ($f -match '\\MEGA(sync)?(\\|$)') { $r.sync_app = 'MEGA' }
-        $roots += $r
-    }
+    if ($f) { $roots += [ordered]@{ name = 'Files'; path = $f } }
     $n = Choose-Folder 'Notes: your notes' 'A folder of Markdown notes, e.g. your Obsidian vault.' (Get-NoteCandidates)
-    if ($n) {
-        $r = [ordered]@{ name = 'Notes'; path = $n; mode = 'write' }
-        if (Test-Path -LiteralPath (Join-Path $n '.obsidian')) { $r.sync_app = 'Obsidian' }
-        $roots += $r
-    }
+    if ($n) { $roots += [ordered]@{ name = 'Notes'; path = $n } }
     if ($roots.Count -eq 0) { Fail "No folders chosen, nothing to share." }
     $token = $null
     if ($cfg) { $token = $cfg.token }   # keep the token so the connector in Claude keeps working
@@ -194,48 +178,19 @@ if (-not $token -or $token -notmatch '^[A-Za-z0-9_-]{32,}$') {
     $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-# Desktop apps the bridge starts when they're needed: the apps that sync the shared folders, and Chrome
-$apps = @()
-$wanted = @($roots | ForEach-Object { $_.sync_app })
-if ($wanted -contains 'MEGA') {
-    $mega = Find-Exe 'MEGAsync' @("$env:LOCALAPPDATA\MEGAsync\MEGAsync.exe", "$env:ProgramFiles\MEGAsync\MEGAsync.exe", "${env:ProgramFiles(x86)}\MEGAsync\MEGAsync.exe")
-    if ($mega) { $apps += [ordered]@{ name = 'MEGA'; process = 'MEGAsync.exe'; launch = @($mega) }; Say "Found MEGA: $mega" }
-    else { Say "Couldn't find the MEGA app, which syncs Files; re-run this installer after installing it." 'Yellow' }
-}
-if ($wanted -contains 'Obsidian') {
-    $vault = ($roots | Where-Object { $_.sync_app -eq 'Obsidian' } | Select-Object -First 1).path
-    $obs = Find-Exe 'Obsidian' @("$env:LOCALAPPDATA\Programs\Obsidian\Obsidian.exe", "$env:LOCALAPPDATA\Obsidian\Obsidian.exe", "$env:ProgramFiles\Obsidian\Obsidian.exe")
-    if ($obs) {
-        # Opening this link starts Obsidian if needed and opens the vault, which is what Obsidian Sync needs
-        $uri = 'obsidian://open?vault=' + [Uri]::EscapeDataString((Split-Path -Leaf $vault))
-        $apps += [ordered]@{ name = 'Obsidian'; process = 'Obsidian.exe'; launch = $uri; vault = $vault }
-        Say "Found Obsidian: $obs"
-    } else { Say "Couldn't find Obsidian, which syncs Notes; re-run this installer after installing it." 'Yellow' }
-}
-$chrome = $null
-foreach ($k in 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe') {
-    $v = (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).'(default)'
-    if ($v -and (Test-Path -LiteralPath $v)) { $chrome = $v; break }
-}
-if (-not $chrome) { $chrome = Find-Exe 'chrome' @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") }
-if ($chrome) {
-    $chromeLaunch = @($chrome)
-    if ($ChromeProfile) { $chromeLaunch += "--profile-directory=$ChromeProfile" }
-    $apps += [ordered]@{ name = 'Chrome'; process = 'chrome.exe'; launch = $chromeLaunch; match = @('\google\chrome\') }
-    Say "Found Chrome: $chrome$(if ($ChromeProfile) { " (profile: $ChromeProfile)" })"
-} else { Say "Couldn't find Google Chrome; the bridge won't be able to start it." 'Yellow' }
+# Each folder is just a name and a path: both are writable, and the bridge works out by itself which app syncs
+# them (Obsidian, MEGA) and where Chrome is, so the config has no app list.
 $cfgOut = [ordered]@{
     listen_port = $Port
     public_url  = "https://$dns"
     token       = $token
-    roots       = $roots
-    apps        = $apps
+    roots       = @($roots | ForEach-Object { [ordered]@{ name = $_.name; path = $_.path } })
     quiet       = $true
 }
 # Keep the settings you added by hand (chrome, security, update, limits, deny lists...; see README)
 if ($cfg) {
     foreach ($prop in $cfg.PSObject.Properties) {
-        if (-not $cfgOut.Contains($prop.Name)) { $cfgOut[$prop.Name] = $prop.Value }
+        if (-not $cfgOut.Contains($prop.Name) -and $prop.Name -ne 'apps') { $cfgOut[$prop.Name] = $prop.Value }
     }
 }
 Write-Utf8NoBom $cfgPath ($cfgOut | ConvertTo-Json -Depth 6)
@@ -297,7 +252,7 @@ For download/upload links to work from Claude's cloud workspace, add this to Cla
   $dns
 
 Shared folders:
-$(($roots | ForEach-Object { "  $($_.name)  ($($_.mode))  $($_.path)" }) -join "`n")
+$(($roots | ForEach-Object { "  $($_.name)  $($_.path)" }) -join "`n")
 "@
 $sumPath = Join-Path $InstallDir 'connector.txt'
 Write-Utf8NoBom $sumPath $summary

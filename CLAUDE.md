@@ -55,6 +55,9 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
   (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
   self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
+- Both folders are always writable (there is no read-only mode), and the config only holds each folder's name and
+  path: `_detect_apps` works out the sync app from markers in the folder (`.obsidian`; `.megaignore`/`.debris`) and
+  finds MEGA, Obsidian and Chrome on the PC. Don't reintroduce per-folder app settings.
 - The server must not do anything by itself while unused: no timers or watchers. Sync apps (MEGA/Obsidian) are
   started when a file tool touches their folder (`sync_for_read` via `resolve`, `ensure_for` on writes), Chrome when a
   Chrome tool needs it (`ChromeLink._start_chrome`), history is pruned from `keep_history`, and the Chrome child starts

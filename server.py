@@ -4,8 +4,8 @@ Claude Code's own Chrome integration).
 
 Exposed to Claude as a custom connector via Tailscale Funnel. Every request
 must carry the secret token (Authorization: Bearer <token>, or the /k/<token>/
-URL prefix). Folders are read-only unless their mode is "write"; nothing is
-ever deleted.
+URL prefix). Claude can read, add and change files in both folders, but nothing
+is ever deleted or moved.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -116,9 +116,8 @@ if sys.stderr is None:
 class Root:
     name: str
     path: Path
-    writable: bool
-    sync_app: str = ""  # name of an app (in CFG["apps"]) that syncs this folder, started when the bridge changes something
     description: str = ""  # what the folder is for, shown to Claude
+    sync_app: str = ""     # the app that syncs it (worked out from the folder at startup, see _detect_apps)
 
 
 ROOTS: dict[str, Root] = {}
@@ -126,8 +125,7 @@ for r in CFG["roots"]:
     name = r["name"].strip().strip("/\\")
     if not name or "/" in name or "\\" in name:
         raise SystemExit(f"config.json: bad root name {r['name']!r}")
-    ROOTS[name.lower()] = Root(name, Path(r["path"]).expanduser(), r.get("mode", "read") == "write", r.get("sync_app", ""),
-                               r.get("description", ""))
+    ROOTS[name.lower()] = Root(name, Path(r["path"]).expanduser(), r.get("description", ""))
 
 
 class BridgeError(ToolError):
@@ -180,8 +178,6 @@ def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) ->
         raise BridgeError("That path is excluded by the bridge's deny list")
     if not want_write:
         sync_for_read(root)  # writes do this (and report it) themselves
-    if want_write and not root.writable:
-        raise BridgeError(f"'{root.name}' is read-only. Writable folders: " + (", ".join(r.name for r in ROOTS.values() if r.writable) or "none"))
     if must_exist and not real.exists():
         raise BridgeError(f"Not found: {root.name}/{rel}")
     return root, real, f"{root.name}/{rel}".rstrip("/")
@@ -354,18 +350,68 @@ class App:
     vault: str = ""              # Obsidian: this vault must be open for Sync to upload
 
 
-def _as_list(v: Any) -> list[str] | None:
-    if not v:
-        return None
-    return [v] if isinstance(v, str) else list(v)
+def _marked(start: Path, markers: tuple[str, ...]) -> Path | None:
+    """The folder itself or the nearest folder above it that holds one of these markers."""
+    p = start
+    for _ in range(8):
+        if any((p / m).exists() for m in markers):
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return None
 
 
-def _load_apps() -> dict[str, App]:
-    return {a["name"].lower(): App(a["name"], a["process"], a.get("launch"), _as_list(a.get("match")), a.get("vault", ""))
-            for a in CFG.get("apps", [])}
+def _first_file(*cands: Any) -> str:
+    return next((str(c) for c in cands if c and Path(c).is_file()), "")
 
 
-APPS = _load_apps()
+def _chrome_exe() -> str:
+    if IS_WINDOWS:
+        import winreg
+
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as k:
+                    exe = _first_file(winreg.QueryValue(k, None))
+                    if exe:
+                        return exe
+            except OSError:
+                pass
+    env = os.environ.get
+    return _first_file(Path(env("ProgramFiles", "")) / "Google/Chrome/Application/chrome.exe",
+                       Path(env("ProgramFiles(x86)", "")) / "Google/Chrome/Application/chrome.exe",
+                       Path(env("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe")
+
+
+def _detect_apps() -> dict[str, App]:
+    """Work out from the folders themselves which app syncs each one, and find the apps on this PC. Obsidian keeps a
+    .obsidian folder in the vault; MEGA puts .megaignore (and .debris) in the folders it syncs. Nothing to configure."""
+    from urllib.parse import quote
+
+    env = os.environ.get
+    apps: dict[str, App] = {}
+    for root in ROOTS.values():
+        vault = _marked(root.path, (".obsidian",))
+        if vault:
+            apps["obsidian"] = App("Obsidian", "Obsidian.exe", "obsidian://open?vault=" + quote(vault.name), None, str(vault))
+            root.sync_app = "Obsidian"
+            continue
+        if _marked(root.path, (".megaignore", ".debris")):
+            mega = _first_file(Path(env("LOCALAPPDATA", "")) / "MEGAsync/MEGAsync.exe",
+                               Path(env("ProgramFiles", "")) / "MEGAsync/MEGAsync.exe",
+                               Path(env("ProgramFiles(x86)", "")) / "MEGAsync/MEGAsync.exe")
+            apps["mega"] = App("MEGA", "MEGAsync.exe", [mega] if mega else None)
+            root.sync_app = "MEGA"
+    chrome = _chrome_exe()
+    if chrome:
+        profile = str((CFG.get("chrome") or {}).get("profile") or "").strip()  # e.g. "Profile 1"
+        apps["chrome"] = App("Chrome", "chrome.exe", [chrome] + ([f"--profile-directory={profile}"] if profile else []),
+                             ["\\google\\chrome\\"])
+    return apps
+
+
+APPS = _detect_apps()
 
 
 def _procs(app: App) -> list:
@@ -938,7 +984,7 @@ def _folder_lines() -> str:
     lines = []
     for r in ROOTS.values():
         what = r.description or DEFAULT_DESCRIPTIONS.get(r.name.lower(), "a shared folder")
-        lines.append(f"- {r.name}: {what}{'' if r.writable else ' (read-only)'}")
+        lines.append(f"- {r.name}: {what}")
     return "\n".join(lines)
 
 
@@ -983,9 +1029,12 @@ def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) ->
     if not path.strip().strip("/"):
         lines = ["Shared folders:"]
         for r in ROOTS.values():
-            sync_for_read(r)
+            started = sync_for_read(r)
             state = "ok" if r.path.exists() else "MISSING on disk"
-            lines.append(f"- {r.name}  ({'writable' if r.writable else 'read-only'}, {state})")
+            app = APPS.get(r.sync_app.lower()) if r.sync_app else None
+            synced = (f", synced by {app.name}: " + ("just started it" if started else app_state(app)[1])) if app and IS_WINDOWS else \
+                     ("" if app else ", no sync app found for it")
+            lines.append(f"- {r.name}  ({state}{synced})")
         return "\n".join(lines)
     root, real, disp = resolve(path)
     if real.is_file():
@@ -1234,7 +1283,7 @@ def append_text(path: str, text: str, create: bool = True) -> str:
 
 @mcp.tool(annotations=WR)
 def create_upload_link(path: str, overwrite: bool = False, minutes: int = 15) -> str:
-    """Make a one-time HTTPS link to upload a file (any type) into a writable folder.
+    """Make a one-time HTTPS link to upload a file (any type) into Files or Notes.
     Upload with: curl -T <localfile> <url>"""
     audit("create_upload_link", path=path, overwrite=overwrite)
     root, real, disp = resolve(path, want_write=True, must_exist=False)
@@ -1247,7 +1296,7 @@ def create_upload_link(path: str, overwrite: bool = False, minutes: int = 15) ->
 
 @mcp.tool(annotations=WR)
 def make_folder(path: str) -> str:
-    """Create a folder (and parents) inside a writable folder."""
+    """Create a folder (and parents) inside Files or Notes."""
     audit("make_folder", path=path)
     root, real, disp = resolve(path, want_write=True, must_exist=False)
     real.mkdir(parents=True, exist_ok=True)
@@ -1674,7 +1723,7 @@ def main():
         lg.setLevel(logging.WARNING)
     port = int(CFG.get("listen_port", 8765))
     log.info("Claude Bridge %s starting on 127.0.0.1:%d; folders: %s", VERSION, port,
-             ", ".join(f"{r.name}={'rw' if r.writable else 'ro'}:{r.path}" for r in ROOTS.values()))
+             ", ".join(f"{r.name}={r.path} (sync: {r.sync_app or 'none found'})" for r in ROOTS.values()))
     for r in ROOTS.values():
         if not r.path.exists():
             log.warning("folder %s does not exist: %s", r.name, r.path)
