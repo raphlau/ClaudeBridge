@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.9.3"
+VERSION = "1.10.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -609,11 +609,54 @@ CHROME = {
     **(CFG.get("chrome") or {}),
 }
 CHROME_PERMISSION_MODES = ("ask", "skip_all_permission_checks", "follow_a_plan")
-# Claude in Chrome tools the bridge doesn't offer (also refused inside browser_batch). file_upload would hand any
-# file on this PC to a web page, and upload_image pushes images into pages. The browser pickers aren't needed: the
-# bridge picks the browser itself, and chrome_status(browser=...) covers the rare case it can't.
-CHROME_BLOCKED = {"file_upload", "upload_image", "gif_creator", "resize_window",
+# Claude in Chrome tools the bridge doesn't offer (also refused inside browser_batch). upload_image pushes images
+# into pages; the browser pickers aren't needed: the bridge picks the browser itself, and chrome_status(browser=...)
+# covers the rare case it can't. file_upload is offered in the bridge's own form, see FILE_UPLOAD_TOOL.
+CHROME_BLOCKED = {"upload_image", "gif_creator", "resize_window",
                   "list_connected_browsers", "select_browser", "switch_browser"}
+# Claude Code's file_upload takes file contents, not paths (it can't read the PC's files by itself). The bridge offers
+# it with paths in Files/Notes instead: each is checked like any file tool (deny lists included), read, and passed on.
+UPLOAD_MAX_BYTES = 10 * 1024 * 1024  # Claude Code's limit for one call
+FILE_UPLOAD_TOOL = Tool.model_validate({
+    "name": "file_upload",
+    "description": (
+        "Attach files from Files or Notes to a file input on the current page, e.g. attachments to an email. "
+        "Don't click the page's upload/attach button (that opens a file picker you can't use): use find or read_page "
+        "to get the file input's ref, then call this. Up to 10 MB in total. Only files in Files and Notes can be used; "
+        "the site must be allowed in the Claude in Chrome extension."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "Files to attach, as bridge paths, e.g. 'Files/CV/cv.pdf' or 'Notes/Trip.md'."},
+            "ref": {"type": "string", "description": "Element reference of the file input, from find or read_page."},
+            "tabId": {"type": "number", "description": "Tab with the file input (see tabs_context_mcp)."},
+        },
+        "required": ["paths", "ref", "tabId"],
+    },
+    "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+})
+
+
+def _upload_files(paths: Any) -> list[dict[str, str]]:
+    """Turn bridge paths into what Claude Code's file_upload wants: [{name, data (base64), mimeType}]."""
+    import base64
+
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        raise BridgeError("Give the files to attach as paths, e.g. 'Files/CV/cv.pdf'.")
+    out, total = [], 0
+    for p in paths:
+        root, real, disp = resolve(str(p))
+        if not real.is_file():
+            raise BridgeError(f"{disp} is not a file")
+        total += real.stat().st_size
+        if total > UPLOAD_MAX_BYTES:
+            raise BridgeError("Too big: files attached in one go must stay under 10 MB in total.")
+        out.append({"name": real.name, "data": base64.b64encode(real.read_bytes()).decode("ascii"),
+                    "mimeType": mimetypes.guess_type(real.name)[0] or "application/octet-stream"})
+    return out
 CHROME_READ_ONLY = {"read_page", "find", "get_page_text", "read_console_messages", "read_network_requests",
                     "tabs_context_mcp"}
 CHROME_CACHE = BASE_DIR / "chrome_tools.json"  # last tool list, so tools/list is instant while the child starts
@@ -946,23 +989,38 @@ class ChromeLink:
             await self.wait_ready(15)
         out = []
         for t in self.tools.values():
+            if t.name == "file_upload":
+                continue  # offered in the bridge's own form below
             ann = ToolAnnotations(title=t.title or None, read_only_hint=t.name in CHROME_READ_ONLY,
                                   destructive_hint=False, open_world_hint=True)
             out.append(t.model_copy(update={"annotations": ann}))
+        out.append(FILE_UPLOAD_TOOL)
         return out
 
     def handles(self, name: str) -> bool:
-        return CHROME.get("enabled", True) and (name in self.tools or name in CHROME_BLOCKED)
+        return CHROME.get("enabled", True) and (name in self.tools or name in CHROME_BLOCKED or name == "file_upload")
 
     async def call(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
         blocked = name if name in CHROME_BLOCKED else next(
             (a.get("name") for a in (arguments.get("actions") or []) if isinstance(a, dict) and a.get("name") in CHROME_BLOCKED),
             None) if name == "browser_batch" else None
         if blocked:
-            raise BridgeError(f"{blocked} isn't available through the bridge." + (
-                " It could send any file on the PC to a web page; ask Raph to pick the file in the browser himself."
-                if blocked == "file_upload" else ""))
+            raise BridgeError(f"{blocked} isn't available through the bridge.")
         audit(f"chrome.{name}", **_chrome_audit_args(arguments))
+        # file_upload, alone or inside browser_batch: swap the bridge paths for the files' contents
+        if name == "file_upload":
+            arguments = {k: v for k, v in arguments.items() if k != "paths"} | {
+                "files": await asyncio.to_thread(_upload_files, arguments.get("paths"))}
+        elif name == "browser_batch" and any(isinstance(a, dict) and a.get("name") == "file_upload"
+                                             for a in (arguments.get("actions") or [])):
+            actions = []
+            for a in arguments.get("actions") or []:
+                if isinstance(a, dict) and a.get("name") == "file_upload":
+                    inp = dict(a.get("input") or {})
+                    inp["files"] = await asyncio.to_thread(_upload_files, inp.pop("paths", None))
+                    a = {**a, "input": inp}
+                actions.append(a)
+            arguments = {**arguments, "actions": actions}
         timeout = float(CHROME.get("call_timeout_seconds", 180))
         await asyncio.to_thread(self.use)  # starts Claude Code's Chrome server if it's idle
         chrome_started = await asyncio.to_thread(self._start_chrome)
@@ -1078,7 +1136,8 @@ Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer,
 Claude in Chrome, run through Claude Code on the PC, so they work from any chat. Start with
 tabs_context_mcp(createIfEmpty=true) and work in your own tab. The bridge starts Chrome and picks the PC's browser by
 itself; if it says it can't tell which browser is the PC's, ask Raph, then call chrome_status(browser=...).
-chrome_status also shows what's wrong when Chrome calls fail. Uploading files to websites isn't available.
+chrome_status also shows what's wrong when Chrome calls fail. To attach files to a page (e.g. email attachments), use
+file_upload with paths in Files or Notes; nothing else on the PC can be uploaded.
 update_bridge checks for a newer version of the bridge and can install it; it also updates itself once a day."""
 
 

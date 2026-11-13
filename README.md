@@ -35,7 +35,7 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 ## Tools
 
-27 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
+28 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
 
 | Tool | What it does | Suggested |
 |---|---|---|
@@ -63,7 +63,9 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 | `javascript_tool` | run JavaScript in the page | Ask |
 | `browser_batch` | several of the above in one go | Ask |
 
-Not offered: `file_upload`, `upload_image`, `gif_creator`, `resize_window`, `list_connected_browsers`, `select_browser` and `switch_browser`. The bridge picks the browser itself, and nothing gets uploaded to websites from the PC.
+| `file_upload` | attach files from Files or Notes to a page, e.g. email attachments (up to 10 MB in one go) | Ask |
+
+Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_browsers`, `select_browser` and `switch_browser`. The bridge picks the browser itself.
 
 ## What keeps it safe
 
@@ -73,7 +75,8 @@ Not offered: `file_upload`, `upload_image`, `gif_creator`, `resize_window`, `lis
 - **Nothing is deleted or moved,** and before any change the previous version is copied to `%LOCALAPPDATA%\ClaudeBridge\history` (kept 30 days).
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
 - **Hidden:** `.obsidian` (plugin code and settings), `.git`, `.ssh`, password databases and key files.
-- **Chrome:** everything happens inside Chrome, under the Claude in Chrome extension's own site permissions. `file_upload` is blocked, since it could send any file on the PC to a website.
+- **Chrome:** everything happens inside Chrome, under the Claude in Chrome extension's own site permissions.
+- **Uploads to websites only from Files and Notes:** `file_upload` takes bridge paths, which are checked like any other file tool, so hidden folders, keys and password files are excluded. The bridge then hands Chrome the files' contents. Claude Code itself can't read files on the PC, so nothing else can be uploaded.
 - **Updates come only from this repo's releases,** checked against their SHA-256. An update never turns a switched-off bridge back on.
 - **Everything is logged** in `logs\bridge.log`, without the text Claude types or writes.
 

@@ -51,7 +51,9 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   (`Guard`). Don't add a shell or delete tool. Never let attacker-controlled text (headers, paths) reach a
   command line: `send_alert` passes the toast XML via an environment variable for that reason.
 - Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
-  Keep `file_upload` blocked, including inside `browser_batch`, and don't log the text Claude types. `chrome_status`
+  `file_upload` is the bridge's own (`FILE_UPLOAD_TOOL`): it takes Files/Notes paths, checks them with `resolve` and
+  passes the contents (Claude Code's version only accepts contents); keep it that way, including inside
+  `browser_batch`, and never accept absolute paths. Don't log the text Claude types or file contents. `chrome_status`
   shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
   (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
   self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
