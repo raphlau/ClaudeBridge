@@ -10,3 +10,4 @@ update_state.json
 update_request.json
 previous/
 dist/
+lockout.json

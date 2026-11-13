@@ -1,18 +1,17 @@
 # Claude Bridge: notes for Claude Code
 
 This folder is Claude Bridge, an MCP server (Python, `server.py`) that the user (Raph) adds to Claude as a
-custom connector, so Claude can reach his **MEGA folder** and **Obsidian vault** on this Windows PC from his
-phone. It's published via **Tailscale Funnel** and protected by a bearer token. See README.md for the design.
+custom connector, so Claude can reach two folders on this Windows PC from his phone: **Files** (his documents;
+it was called "Backups" before 1.6, and that name still works as an alias) and **Notes** (Markdown notes). It also
+passes through Claude in Chrome. It's published via **Tailscale Funnel** and protected by a bearer token. See
+README.md for the design.
 
 ## Your job when asked to "set this up"
 
-1. Check prerequisites: `tailscale status` shows this PC connected, MagicDNS is on (the PC has a `*.ts.net`
-   name), and the MEGA desktop app (MEGAsync.exe) and Obsidian are installed.
-2. Run the installer. It's interactive (`Read-Host` prompts for the two folder paths), so either let Raph run
-   `install.cmd` himself, or ask him for the two paths and pre-create `%LOCALAPPDATA%\ClaudeBridge\config.json`.
-   To pre-create it, copy `roots` from `config.example.json` (keep `name`, `mode: write` and `sync_app`); the installer
-   fills in the token, public URL, MEGA/Obsidian launch details and the Claude app itself.
-   Then run `powershell -ExecutionPolicy Bypass -File .\install.ps1`, which keeps an existing config.
+1. Check prerequisites: `tailscale status` shows this PC connected, and MagicDNS is on (the PC has a `*.ts.net`
+   name).
+2. Raph runs the install one-liner (below) from PowerShell opened from the Start menu. It's interactive: it suggests
+   folders (synced document folders, Obsidian vaults from `%APPDATA%\obsidian\obsidian.json`) and he picks.
 3. If Tailscale asks to enable Funnel, Raph has to approve it in the browser; tell him.
 4. Verify:
    - `%LOCALAPPDATA%\ClaudeBridge\.venv\Scripts\python.exe %LOCALAPPDATA%\ClaudeBridge\selftest.py --public`
@@ -47,7 +46,10 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
 ## Rules
 
 - Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no delete
-  or move tools, MEGA/Obsidian can't be quit, `.obsidian`/`.git`/keys hidden, history copy before every change. Don't add a shell or delete tool.
+  or move tools, sync apps can't be quit, `.obsidian`/`.git`/keys hidden, history copy before every change,
+  no writing programs/scripts/shortcuts (`DENY_WRITE_EXTS`), uploads get Mark-of-the-Web, wrong-token lockout
+  (`Guard`). Don't add a shell or delete tool. Never let attacker-controlled text (headers, paths) reach a
+  command line: `send_alert` passes the toast XML via an environment variable for that reason.
 - Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
   Keep `file_upload` blocked, including inside `browser_batch`, and don't log the text Claude types. `chrome_status`
   shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself

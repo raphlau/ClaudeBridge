@@ -1,22 +1,23 @@
 {
   "listen_port": 8765,
   "public_url": "https://your-pc.your-tailnet.ts.net",
-  "token": "generated-by-install.ps1-at-least-32-characters-long",
+  "token": "generated-by-install.ps1-43-random-characters",
   "roots": [
-    { "name": "Backups", "path": "D:\\MEGA\\Important Documents", "mode": "write", "sync_app": "MEGA" },
+    { "name": "Files", "path": "C:\\Users\\you\\Documents\\MEGA\\Important Documents", "mode": "write", "sync_app": "MEGA" },
     { "name": "Notes", "path": "C:\\Users\\you\\Documents\\Obsidian\\Vault", "mode": "write", "sync_app": "Obsidian" }
   ],
-  "sync_apps": [
-    { "name": "MEGA", "process": "MEGAsync.exe", "launch": ["C:\\Users\\you\\AppData\\Local\\MEGAsync\\MEGAsync.exe"] },
-    { "name": "Obsidian", "process": "Obsidian.exe", "launch": "obsidian://open?vault=Vault", "vault": "C:\\Users\\you\\Documents\\Obsidian\\Vault" }
+  "apps": [
+    { "name": "MEGA", "process": "MEGAsync.exe", "launch": ["C:\\Users\\you\\AppData\\Local\\MEGAsync\\MEGAsync.exe"], "can_quit": false },
+    { "name": "Obsidian", "process": "Obsidian.exe", "launch": "obsidian://open?vault=Vault", "vault": "C:\\Users\\you\\Documents\\Obsidian\\Vault", "can_quit": false },
+    { "name": "Chrome", "process": "chrome.exe", "launch": ["C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"], "match": ["\\google\\chrome\\"], "can_quit": true },
+    { "name": "Claude", "process": "claude.exe", "launch": ["explorer.exe", "shell:AppsFolder\\<AppID from Get-StartApps>"], "can_quit": true }
   ],
   "history_days": 30,
   "deny_folders": [".git", ".obsidian", ".ssh", ".gnupg", ".debris", "$recycle.bin"],
   "deny_files": ["*.kdbx", "*.kdb", ".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*"],
-  "claude_app": {
-    "launch": ["explorer.exe", "shell:AppsFolder\\<AppID from Get-StartApps>"],
-    "exe_match": ["\\windowsapps\\claude_", "\\anthropicclaude\\", "\\programs\\claude\\"]
-  },
   "limits": { "max_upload_mb": 500, "link_minutes": 15 },
+  "chrome": { "enabled": true, "idle_minutes": 10 },
+  "security": { "max_bad_tokens": 10, "window_minutes": 10, "lockout_minutes": 60, "alert_url": "" },
+  "update": { "auto": true },
   "quiet": true
 }

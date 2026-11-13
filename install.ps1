@@ -107,15 +107,47 @@ if (-not (Test-Path $pyw)) { Fail "Python environment missing: $pyw" }
 
 # ---------------------------------------------------------------- config
 $cfgPath = Join-Path $InstallDir 'config.json'
-function Ask-Folder([string]$label, [string]$hint) {
+function Get-FileCandidates {
+    # Synced document folders, best guesses first: subfolders that look like important papers, then the folder itself
+    $bases = @("$env:USERPROFILE\Documents\MEGA", "$env:USERPROFILE\MEGA", "$env:USERPROFILE\MEGAsync", "$env:USERPROFILE\Dropbox")
+    if ($env:OneDrive) { $bases += "$env:OneDrive\Documents" }
+    $bases += @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object { "$($_.DeviceID)\MEGA" })
+    $out = @()
+    foreach ($b in $bases) {
+        if (-not (Test-Path -LiteralPath $b -PathType Container)) { continue }
+        $out += @(Get-ChildItem -LiteralPath $b -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'document|important|paper|admin' } | ForEach-Object { $_.FullName })
+        $out += $b
+    }
+    $out += "$env:USERPROFILE\Documents"
+    return @($out | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -Unique)
+}
+function Get-NoteCandidates {
+    # Obsidian lists its vaults in %APPDATA%\obsidian\obsidian.json; most recently opened first
+    $out = @()
+    $f = Join-Path $env:APPDATA 'obsidian\obsidian.json'
+    if (Test-Path -LiteralPath $f) {
+        try {
+            $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+            $out += @($j.vaults.PSObject.Properties | ForEach-Object { $_.Value } | Sort-Object { [double]$_.ts } -Descending | ForEach-Object { $_.path })
+        } catch {}
+    }
+    $out += "$env:USERPROFILE\Documents\Notes"
+    return @($out | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique)
+}
+function Choose-Folder([string]$label, [string]$hint, [string[]]$candidates) {
+    Write-Host "`n$label" -ForegroundColor White
+    Write-Host "  $hint" -ForegroundColor DarkGray
+    $shown = @($candidates | Select-Object -First 6)
+    for ($i = 0; $i -lt $shown.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i + 1), $shown[$i]) }
+    $prompt = if ($shown.Count) { "  Enter for 1, another number, a folder path, or 'skip'" } else { "  Folder path, or 'skip'" }
     while ($true) {
-        Write-Host "`n$label" -ForegroundColor White
-        Write-Host "  $hint" -ForegroundColor DarkGray
-        $p = Read-Host "  Folder path (leave blank to skip)"
-        if (-not $p) { return $null }
-        $p = $p.Trim().Trim('"')
-        if (Test-Path -LiteralPath $p -PathType Container) { return (Resolve-Path -LiteralPath $p).Path }
-        Write-Host "  That folder doesn't exist, try again." -ForegroundColor Yellow
+        $a = ("" + (Read-Host $prompt)).Trim().Trim('"')
+        if ($a -eq 'skip') { return $null }
+        if (-not $a -and $shown.Count) { return $shown[0] }
+        if ($a -match '^\d+$' -and [int]$a -ge 1 -and [int]$a -le $shown.Count) { return $shown[[int]$a - 1] }
+        if ($a -and (Test-Path -LiteralPath $a -PathType Container)) { return (Resolve-Path -LiteralPath $a).Path }
+        Write-Host "  That's not one of the options or an existing folder; try again." -ForegroundColor Yellow
     }
 }
 function Find-Exe([string]$procName, [string[]]$candidates) {
@@ -131,39 +163,57 @@ if (Test-Path $cfgPath) {
 }
 if ($Unattended -and -not $cfg) { Fail "No usable config.json in $InstallDir; run the installer by hand once first." }
 if ($cfg -and -not $Reconfigure) {
-    Say "`nKeeping your existing config.json (re-run with -Reconfigure to choose folders again)."
+    Say "Keeping your folders and token (re-run with -Reconfigure to choose folders again)."
     $token = $cfg.token
     $roots = @($cfg.roots)
     if ($cfg.listen_port) { $Port = [int]$cfg.listen_port }
+    foreach ($r in $roots) {
+        # Before 1.6 the documents folder was called 'Backups'; old paths keep working through the alias
+        if ($r.name -eq 'Backups') {
+            $r.name = 'Files'
+            $r | Add-Member -NotePropertyName aliases -NotePropertyValue @('Backups') -Force
+            $h = Join-Path $InstallDir 'history\Backups'
+            if ((Test-Path -LiteralPath $h) -and -not (Test-Path -LiteralPath (Join-Path $InstallDir 'history\Files'))) {
+                Rename-Item -LiteralPath $h -NewName 'Files'
+            }
+            Say "Renamed the shared folder 'Backups' to 'Files' ('Backups/...' paths still work)."
+        }
+    }
 } else {
-    Say "`nChoose the folders. Claude can read them and add or change files, but never delete or move anything."
-    Say "Tip: paste paths from Explorer (Shift+right-click a folder > Copy as path)."
+    Say "`nPick the two folders to share. Claude can read and add or change files there, but never delete or move anything."
     $roots = @()
-    $b = Ask-Folder 'Your MEGA folder' 'the folder the MEGA app syncs, or a subfolder such as "Important Documents"'
-    if ($b) { $roots += [ordered]@{ name = 'Backups'; path = $b; mode = 'write'; sync_app = 'MEGA' } }
-    $n = Ask-Folder 'Your Obsidian vault' 'the top folder of the vault (the one that contains a .obsidian folder)'
+    $f = Choose-Folder 'Files: your documents' 'Papers, scans, letters, office files... e.g. a synced "Important Documents" folder.' (Get-FileCandidates)
+    if ($f) {
+        $r = [ordered]@{ name = 'Files'; path = $f; mode = 'write' }
+        if ($f -match '\\MEGA(sync)?(\\|$)') { $r.sync_app = 'MEGA' }
+        $roots += $r
+    }
+    $n = Choose-Folder 'Notes: your notes' 'A folder of Markdown notes, e.g. your Obsidian vault.' (Get-NoteCandidates)
     if ($n) {
-        if (-not (Test-Path -LiteralPath (Join-Path $n '.obsidian'))) { Say "  Note: there's no .obsidian folder in there. Is this the vault's top folder?" 'Yellow' }
-        $roots += [ordered]@{ name = 'Notes'; path = $n; mode = 'write'; sync_app = 'Obsidian' }
+        $r = [ordered]@{ name = 'Notes'; path = $n; mode = 'write' }
+        if (Test-Path -LiteralPath (Join-Path $n '.obsidian')) { $r.sync_app = 'Obsidian' }
+        $roots += $r
     }
     if ($roots.Count -eq 0) { Fail "No folders chosen, nothing to share." }
     $token = $null
     if ($cfg) { $token = $cfg.token }   # keep the token so the connector in Claude keeps working
 }
 
-if (-not $token -or $token.Length -lt 32) {
+if (-not $token -or $token -notmatch '^[A-Za-z0-9_-]{32,}$') {
+    # 32 bytes from the OS's cryptographic random generator: 256 bits, 43 characters, made on this PC
     $bytes = New-Object byte[] 32
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-# Desktop apps the bridge can check and start: MEGA and Obsidian (they upload changes), Chrome and Claude
+# Desktop apps the bridge can check and start: the apps that sync the shared folders (started only when Claude
+# changes something there), Chrome and Claude
 $apps = @()
 $wanted = @($roots | ForEach-Object { $_.sync_app })
 if ($wanted -contains 'MEGA') {
     $mega = Find-Exe 'MEGAsync' @("$env:LOCALAPPDATA\MEGAsync\MEGAsync.exe", "$env:ProgramFiles\MEGAsync\MEGAsync.exe", "${env:ProgramFiles(x86)}\MEGAsync\MEGAsync.exe")
     if ($mega) { $apps += [ordered]@{ name = 'MEGA'; process = 'MEGAsync.exe'; launch = @($mega); can_quit = $false }; Say "Found MEGA: $mega" }
-    else { Say "Couldn't find the MEGA desktop app (MEGAsync.exe). Changes in Backups won't upload until it runs; re-run this installer after installing it." 'Yellow' }
+    else { Say "Couldn't find the MEGA app, which syncs Files; re-run this installer after installing it." 'Yellow' }
 }
 if ($wanted -contains 'Obsidian') {
     $vault = ($roots | Where-Object { $_.sync_app -eq 'Obsidian' } | Select-Object -First 1).path
@@ -173,7 +223,7 @@ if ($wanted -contains 'Obsidian') {
         $uri = 'obsidian://open?vault=' + [Uri]::EscapeDataString((Split-Path -Leaf $vault))
         $apps += [ordered]@{ name = 'Obsidian'; process = 'Obsidian.exe'; launch = $uri; vault = $vault; can_quit = $false }
         Say "Found Obsidian: $obs"
-    } else { Say "Couldn't find Obsidian. Note changes won't sync until it runs; re-run this installer after installing it." 'Yellow' }
+    } else { Say "Couldn't find Obsidian, which syncs Notes; re-run this installer after installing it." 'Yellow' }
 }
 $chrome = $null
 foreach ($k in 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe') {

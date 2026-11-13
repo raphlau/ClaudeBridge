@@ -7,11 +7,12 @@
     .\bridge.cmd restart       restart the server (after editing config.json)
     .\bridge.cmd logs          last 60 log lines (every tool call is logged)
     .\bridge.cmd update        install the latest release now (it also happens by itself once a day)
+    .\bridge.cmd unlock        lift a lockout (after repeated wrong-token requests) before it ends by itself
     .\bridge.cmd test          run the server in this window to see startup errors
     .\bridge.cmd rotate-token  make a new secret (update the connector in Claude afterwards)
     .\bridge.cmd uninstall     remove the tasks and the Funnel (leaves this folder for you to delete)
 #>
-param([Parameter(Position = 0)][ValidateSet('status', 'on', 'off', 'restart', 'logs', 'update', 'test', 'rotate-token', 'uninstall')][string]$Command = 'status')
+param([Parameter(Position = 0)][ValidateSet('status', 'on', 'off', 'restart', 'logs', 'update', 'unlock', 'test', 'rotate-token', 'uninstall')][string]$Command = 'status')
 
 $ErrorActionPreference = 'Stop'
 $Dir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -39,6 +40,12 @@ switch ($Command) {
         $ver = Select-String -LiteralPath (Join-Path $Dir 'server.py') -Pattern '^VERSION = "([0-9.]+)"' -List
         Write-Host "Version:       $(if ($ver) { $ver.Matches[0].Groups[1].Value } else { '?' })"
         Write-Host "Task:          $(if ($t) { $t.State } else { 'not installed' })"
+        $lock = Join-Path $Dir 'lockout.json'
+        if (Test-Path -LiteralPath $lock) {
+            $l = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
+            $left = [DateTimeOffset]::FromUnixTimeSeconds([long]$l.until).LocalDateTime
+            if ($left -gt (Get-Date)) { Write-Host "LOCKED:        until $($l.until_text) ($($l.wrong_tokens) wrong tokens, last from $($l.last_from)); .\bridge.cmd unlock lifts it" -ForegroundColor Red }
+        }
         $upd = Join-Path $Dir 'update_state.json'
         if (Test-Path -LiteralPath $upd) {
             $u = Get-Content -LiteralPath $upd -Raw | ConvertFrom-Json
@@ -67,6 +74,12 @@ switch ($Command) {
         Write-Host "Local server: $(if (Health "$target/healthz") { 'OK' } else { 'not responding; try .\bridge.cmd test' })"
     }
     'logs' { Get-Content -LiteralPath (Join-Path $Dir 'logs\bridge.log') -Tail 60 }
+    'unlock' {
+        Remove-Item -LiteralPath (Join-Path $Dir 'lockout.json') -Force -ErrorAction SilentlyContinue
+        Stop-Server; Start-Sleep -Seconds 1; Start-ScheduledTask -TaskName $TaskName; Start-Sleep -Seconds 3
+        Write-Host "Unlocked. Local server: $(if (Health "$target/healthz") { 'OK' } else { 'not responding; try .\bridge.cmd test' })"
+        Write-Host "If those wrong tokens weren't yours, also run .\bridge.cmd rotate-token." -ForegroundColor Yellow
+    }
     'update' {
         # Runs update.ps1 through its scheduled task, so it works the same from any window
         if (-not (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue)) {

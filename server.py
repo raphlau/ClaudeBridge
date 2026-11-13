@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -60,8 +60,9 @@ def load_config() -> dict[str, Any]:
     with open(CONFIG_PATH, encoding="utf-8-sig") as f:  # tolerate a BOM from PowerShell
         cfg = json.load(f)
     token = cfg.get("token", "")
-    if len(token) < 32:
-        raise SystemExit("config.json: 'token' must be at least 32 characters")
+    # install.ps1 makes 43 random characters (256 bits); refuse anything short or obviously hand-made
+    if len(token) < 32 or len(set(token)) < 16 or not re.fullmatch(r"[A-Za-z0-9_\-]+", token):
+        raise SystemExit("config.json: 'token' must be a long random string (run 'bridge.cmd rotate-token' to make one)")
     if not cfg.get("roots"):
         raise SystemExit("config.json: add at least one entry to 'roots'")
     return cfg
@@ -81,6 +82,16 @@ LIMITS = {
 DENY_FOLDERS = {s.lower() for s in CFG.get("deny_folders", [".git", ".obsidian", ".ssh", ".gnupg", ".debris", "$recycle.bin"])}
 # Any file whose name matches one of these globs is hidden.
 DENY_FILES = [s.lower() for s in CFG.get("deny_files", ["*.kdbx", "*.kdb", ".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*"])]
+# Never written, created or uploaded: things Windows runs or follows when opened or merely shown in Explorer
+# (programs, scripts, shortcuts, installers). Reading them is still allowed.
+DENY_WRITE_EXTS = {s.lower() for s in CFG.get("deny_write_exts", [
+    ".exe", ".com", ".scr", ".pif", ".cpl", ".msi", ".msp", ".msc", ".dll", ".sys", ".ocx", ".bat", ".cmd",
+    ".ps1", ".psm1", ".psd1", ".ps1xml", ".psc1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".wsc", ".hta",
+    ".sct", ".jar", ".py", ".pyw", ".sh", ".reg", ".inf", ".lnk", ".url", ".website", ".scf", ".library-ms",
+    ".searchconnector-ms", ".appref-ms", ".application", ".appx", ".msix", ".msixbundle", ".appinstaller",
+    ".settingcontent-ms", ".chm", ".xll", ".iqy", ".slk", ".gadget"])}
+DENY_WRITE_NAMES = {"desktop.ini", "autorun.inf"}
+WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$", re.IGNORECASE)
 
 LOG_DIR = Path(CFG.get("log_dir") or BASE_DIR / "logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -106,7 +117,8 @@ class Root:
     name: str
     path: Path
     writable: bool
-    sync_app: str = ""  # name of an entry in CFG["sync_apps"] that uploads changes in this folder
+    sync_app: str = ""  # name of an app (in CFG["apps"]) that syncs this folder, started when the bridge changes something
+    description: str = ""  # what the folder is for, shown to Claude
 
 
 ROOTS: dict[str, Root] = {}
@@ -114,7 +126,15 @@ for r in CFG["roots"]:
     name = r["name"].strip().strip("/\\")
     if not name or "/" in name or "\\" in name:
         raise SystemExit(f"config.json: bad root name {r['name']!r}")
-    ROOTS[name.lower()] = Root(name, Path(r["path"]).expanduser(), r.get("mode", "read") == "write", r.get("sync_app", ""))
+    ROOTS[name.lower()] = Root(name, Path(r["path"]).expanduser(), r.get("mode", "read") == "write", r.get("sync_app", ""),
+                               r.get("description", ""))
+# Old names still work in paths (e.g. 'Backups/...' after the folder was renamed to 'Files')
+ALIASES: dict[str, Root] = {}
+for r in CFG["roots"]:
+    aliases = r.get("aliases") or []
+    for a in [aliases] if isinstance(aliases, str) else aliases:
+        if a.lower() not in ROOTS:
+            ALIASES[a.lower()] = ROOTS[r["name"].strip().strip("/\\").lower()]
 
 
 class BridgeError(ToolError):
@@ -139,12 +159,22 @@ def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) ->
     if "\x00" in vpath or re.match(r"^[A-Za-z]:", vpath):
         raise BridgeError("Use paths like 'Notes/sub/file.md', not drive paths")
     head, _, rest = vpath.partition("/")
-    root = ROOTS.get(head.lower())
+    root = ROOTS.get(head.lower()) or ALIASES.get(head.lower())
     if root is None:
         raise BridgeError(f"Unknown folder {head!r}. Available: " + ", ".join(r.name for r in ROOTS.values()))
     parts = [p for p in rest.split("/") if p not in ("", ".")]
     if ".." in parts:
         raise BridgeError("'..' is not allowed")
+    for p in parts:
+        # ':' would reach NTFS alternate data streams; Windows silently drops trailing dots/spaces, and device
+        # names (CON, NUL...) aren't files. All three can make a name mean something other than it looks.
+        if ":" in p or p != p.rstrip(". ") or WIN_RESERVED.match(p) or any(ord(c) < 32 for c in p):
+            raise BridgeError(f"Not a usable file or folder name: {p!r}")
+    if want_write and parts:
+        name = parts[-1].lower()
+        if name in DENY_WRITE_NAMES or any(name.endswith(ext) for ext in DENY_WRITE_EXTS):
+            raise BridgeError("The bridge doesn't write programs, scripts or shortcuts (they could run on the PC). "
+                              "Save it under another extension, e.g. .txt, and Raph can rename it.")
     base = root.path.resolve()
     target = base.joinpath(*parts) if parts else base
     real = target.resolve()
@@ -251,7 +281,7 @@ def keep_history(root: Root, real: Path) -> str:
     if not real.is_file():
         return ""
     if real.stat().st_size > HISTORY_MAX_BYTES:
-        return " (too big for local history; MEGA/Obsidian version history still applies)"
+        return " (too big for local history; the sync app's own version history still applies)"
     rel = real.resolve().relative_to(root.path.resolve())
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
     dest = HISTORY_DIR / root.name / rel.parent / f"{rel.name}.{stamp}"
@@ -276,6 +306,18 @@ def prune_history() -> None:
                 f.unlink()
         except OSError:
             pass
+
+
+def mark_from_internet(real: Path) -> None:
+    """Give a file the bridge created the same 'downloaded from the internet' mark a browser would (an NTFS
+    Zone.Identifier stream), so Windows SmartScreen and Office Protected View treat it with caution."""
+    if not IS_WINDOWS:
+        return
+    try:
+        with open(f"{real}:Zone.Identifier", "w", encoding="ascii", newline="") as f:
+            f.write("[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=claude-bridge\r\n")
+    except OSError:
+        pass  # not NTFS (e.g. a FAT drive): nothing to mark
 
 
 def read_for_edit(real: Path) -> tuple[str, bool, bool]:
@@ -871,13 +913,27 @@ CHROME_LINK = ChromeLink()
 
 # ---------------------------------------------------------------- MCP server
 
+DEFAULT_DESCRIPTIONS = {
+    "files": "his documents and other files (PDFs, scans, letters, office files, images)",
+    "notes": "his notes (Markdown files; an Obsidian vault)",
+}
+
+
+def _folder_lines() -> str:
+    lines = []
+    for r in ROOTS.values():
+        what = r.description or DEFAULT_DESCRIPTIONS.get(r.name.lower(), "a shared folder")
+        lines.append(f"- {r.name}: {what}{'' if r.writable else ' (read-only)'}")
+    return "\n".join(lines)
+
+
 INSTRUCTIONS = f"""Claude Bridge v{VERSION}: access to folders on Raph's PC.
-Paths always start with a shared folder name, e.g. 'Notes/Insurance.md'. Call list_dir with no path to see the folders.
-Backups is his MEGA folder and Notes is his Obsidian vault: changes there sync to the cloud and his other devices,
-so change only what was asked. Prefer edit_text/append_text over rewriting whole notes. Nothing can be deleted or moved;
-the bridge keeps the previous version of anything it changes. Write tools also make sure MEGA/Obsidian are running.
+{_folder_lines()}
+Paths always start with the folder name, e.g. 'Notes/Insurance.md'. Changes sync to the cloud and his other devices,
+so change only what was asked. Prefer edit_text/append_text over rewriting whole notes. Nothing can be deleted or moved,
+and the bridge keeps the previous version of anything it changes. It won't write programs, scripts or shortcuts.
 For big or binary files (docx, xlsx, zip...), use create_download_link and fetch the URL from your own workspace.
-app_status / start_app / quit_app manage MEGA, Obsidian, Chrome and the Claude desktop app.
+app_status / start_app / quit_app manage the apps the bridge knows (Chrome, the Claude desktop app, sync apps).
 Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer, read_page, find, get_page_text...) are
 Claude in Chrome, run through Claude Code on the PC, so they work from any chat, linked or not, without the Claude app.
 Start with tabs_context_mcp(createIfEmpty=true) and work in your own tab. If a call says Chrome or the extension isn't
@@ -1120,7 +1176,7 @@ def write_text(path: str, content: str, overwrite: bool = False) -> str:
 def edit_text(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     """Replace an exact piece of text in a text file (e.g. a note). old_text must appear exactly once
     unless replace_all=True. Read the file first so old_text matches exactly. Line endings and encoding are kept."""
-    audit("edit_text", path=path, old=old_text, new=new_text, replace_all=replace_all)
+    audit("edit_text", path=path, old_chars=len(old_text), new_chars=len(new_text), replace_all=replace_all)
     root, real, disp = resolve(path, want_write=True)
     if not real.is_file():
         raise BridgeError(f"{disp} is not a file")
@@ -1181,8 +1237,8 @@ def make_folder(path: str) -> str:
 
 @mcp.tool(annotations=RO)
 def app_status() -> str:
-    """Which desktop apps are running on the PC: MEGA and Obsidian (they upload changes in Backups/Notes),
-    Chrome and the Claude desktop app (needed for Claude in Chrome / linking a session to the PC)."""
+    """Which desktop apps the bridge knows are running on the PC: the apps that sync the shared folders, Chrome,
+    and the Claude desktop app."""
     audit("app_status")
     if not APPS:
         return "No apps configured"
@@ -1201,8 +1257,8 @@ def app_status() -> str:
 
 @mcp.tool(annotations=WR)
 async def start_app(name: str) -> str:
-    """Start a desktop app on the PC if it isn't running: 'MEGA', 'Obsidian' (also opens the vault),
-    'Chrome' or 'Claude'. For Claude in Chrome, start Chrome, then Claude. Needs someone signed in to Windows
+    """Start a desktop app on the PC if it isn't running: one named by app_status, e.g. 'Chrome' or 'Claude'
+    (a notes app also gets its vault opened). Needs someone signed in to Windows
     (a locked screen is fine)."""
     audit("start_app", name=name)
     app = get_app(name)
@@ -1231,7 +1287,7 @@ async def start_app(name: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False))
 async def quit_app(name: str) -> str:
     """Close a desktop app on the PC: 'Claude' (ends any remote link to the computer) or 'Chrome'
-    (closed like clicking X, so tabs come back next time). MEGA and Obsidian can't be closed from here."""
+    (closed like clicking X, so tabs come back next time). Apps that sync the shared folders can't be closed from here."""
     audit("quit_app", name=name)
     app = get_app(name)
     if not app.can_quit:
@@ -1346,6 +1402,7 @@ async def healthz(request: Request):
 async def download(request: Request):
     info = LINKS.get(request.path_params["token"])
     if not info or info["kind"] != "download" or info["expires"] < time.time() or not info["path"].is_file():
+        GUARD.bad_attempt("download link", _client(request.scope))
         return PlainTextResponse("Link not found or expired", status_code=404)
     log.info("download %s", info["display"])
     return FileResponse(info["path"], filename=info["path"].name,
@@ -1357,6 +1414,7 @@ async def upload(request: Request):
     tok = request.path_params["token"]
     info = LINKS.get(tok)
     if not info or info["kind"] != "upload" or info["expires"] < time.time():
+        GUARD.bad_attempt("upload link", _client(request.scope))
         return PlainTextResponse("Link not found or expired", status_code=404)
     LINKS.pop(tok, None)  # one use
     dest: Path = info["path"]
@@ -1377,6 +1435,7 @@ async def upload(request: Request):
                     raise BridgeError("too large")
                 f.write(chunk)
         os.replace(tmp, dest)
+        mark_from_internet(dest)
     except BridgeError:
         tmp.unlink(missing_ok=True)
         return PlainTextResponse("Upload too large", status_code=413)
@@ -1389,14 +1448,116 @@ async def upload(request: Request):
     return JSONResponse({"saved": info["display"], "bytes": size, "sync": sync})
 
 
+# ---------------------------------------------------------------- lockout and alerts
+#
+# Internet scanners hit the public address all day without any token; those are only logged. A request that
+# presents a WRONG token (Bearer header, /k/ URL, or a one-time link) means someone is trying to get in: after
+# security.max_bad_tokens of those within security.window_minutes, the bridge locks itself (every request is
+# refused, even with the right token) for security.lockout_minutes, and alerts Raph.
+
+SECURITY = {"max_bad_tokens": 10, "window_minutes": 10, "lockout_minutes": 60, "alert_url": "",
+            **(CFG.get("security") or {})}
+LOCK_FILE = BASE_DIR / "lockout.json"  # survives restarts; 'bridge.cmd unlock' removes it
+
+
+def _client(scope: dict) -> str:
+    """Who sent it (Funnel passes the real address in X-Forwarded-For). Only a valid IP is ever used."""
+    import ipaddress
+
+    raw = dict(scope.get("headers") or []).get(b"x-forwarded-for", b"").decode("latin-1").split(",")[0].strip()
+    raw = raw or (scope.get("client") or ("", 0))[0]
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        return "unknown"
+
+
+def send_alert(title: str, body: str) -> None:
+    """A Windows notification on the PC, plus a push to security.alert_url if set (e.g. an ntfy.sh topic)."""
+    log.warning("ALERT: %s: %s", title, body)
+    if IS_WINDOWS:
+        from xml.sax.saxutils import escape
+
+        xml = (f"<toast scenario='reminder'><visual><binding template='ToastGeneric'><text>{escape(title)}</text>"
+               f"<text>{escape(body)}</text></binding></visual><actions><action content='OK' arguments='ok'/></actions></toast>")
+        ps = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+              "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;"
+              "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:CB_TOAST);"
+              "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+              "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')"
+              ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
+        try:
+            subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             env={**os.environ, "CB_TOAST": xml}, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            log.warning("couldn't show the alert on the PC: %s", e)
+    url = str(SECURITY.get("alert_url") or "").strip()
+    if url.startswith("https://"):
+        try:
+            req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST",
+                                         headers={"Title": title, "Priority": "high", "Tags": "warning",
+                                                  "User-Agent": f"ClaudeBridge/{VERSION}"})
+            urllib.request.urlopen(req, timeout=15).close()
+        except Exception as e:  # noqa: BLE001
+            log.warning("couldn't send the alert to alert_url: %s", _err(e))
+
+
+class Guard:
+    def __init__(self) -> None:
+        self.bad: list[float] = []
+        self.until = 0.0
+        self._lock = threading.Lock()
+        try:
+            self.until = float(json.loads(LOCK_FILE.read_text(encoding="utf-8")).get("until", 0))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def locked(self) -> bool:
+        return time.time() < self.until
+
+    def bad_attempt(self, kind: str, who: str) -> None:
+        now = time.time()
+        window = float(SECURITY.get("window_minutes", 10)) * 60
+        limit = max(3, int(SECURITY.get("max_bad_tokens", 10)))
+        with self._lock:
+            self.bad = [t for t in self.bad if now - t < window] + [now]
+            log.warning("wrong token (%s) from %s: %d in the last %d min", kind, who, len(self.bad), window // 60)
+            if len(self.bad) < limit or self.locked():
+                return
+            minutes = max(1, int(SECURITY.get("lockout_minutes", 60)))
+            self.until = now + minutes * 60
+            count, self.bad = len(self.bad), []
+            try:
+                LOCK_FILE.write_text(json.dumps({"until": self.until, "until_text": fmt_time(self.until), "since": fmt_time(now),
+                                                 "wrong_tokens": count, "last_from": who}), encoding="utf-8")
+            except OSError as e:
+                log.warning("couldn't save the lockout: %s", e)
+        threading.Thread(target=send_alert, daemon=True, args=(
+            "Claude Bridge locked",
+            f"{count} requests with a wrong token in {int(window // 60)} min (last from {who}). The bridge refuses "
+            f"everything until {fmt_time(self.until)[-5:]}. If that wasn't you, run 'bridge.cmd rotate-token' on the PC.")).start()
+
+
+GUARD = Guard()
+
+
 # ---------------------------------------------------------------- auth wrapper
 
 
-class TokenGate:
-    """Require the secret token on everything except /healthz and the one-time link routes.
-    Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL prefix."""
+async def _respond(send, status: int, body: bytes) -> None:
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
 
-    OPEN_PREFIXES = ("/healthz", "/dl/", "/ul/")
+
+class TokenGate:
+    """Require the secret token on everything except /healthz and the one-time link routes (which carry their
+    own random token). Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL prefix. While locked
+    (see Guard), everything but /healthz is refused."""
+
+    LINK_PREFIXES = ("/dl/", "/ul/")
 
     def __init__(self, app, token: str):
         self.app = app
@@ -1406,30 +1567,35 @@ class TokenGate:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path: str = scope.get("path", "")
-        if path.startswith(self.OPEN_PREFIXES):
+        if path == "/healthz":
             return await self.app(scope, receive, send)
-        ok = False
+        if GUARD.locked():
+            await asyncio.sleep(1.0)
+            return await _respond(send, 503, json.dumps({"error": "Claude Bridge is locked after repeated wrong-token "
+                                  f"requests, until {fmt_time(GUARD.until)}. Unlock on the PC: bridge.cmd unlock"}).encode())
+        if path.startswith(self.LINK_PREFIXES):
+            return await self.app(scope, receive, send)
+        ok = presented = False
         if path.startswith("/k/"):
+            presented = True
             _, _, rest = path[3:].partition("/")
             key = path[3:].split("/", 1)[0].encode()
             if hmac.compare_digest(key, self.token):
                 ok = True
                 scope = dict(scope, path="/" + rest, raw_path=("/" + rest).encode())
         else:
-            headers = dict(scope.get("headers") or [])
-            auth = headers.get(b"authorization", b"")
+            auth = dict(scope.get("headers") or []).get(b"authorization", b"")
+            presented = bool(auth.strip())
             if auth[:7].lower() == b"bearer " and hmac.compare_digest(auth[7:].strip(), self.token):
                 ok = True
         if not ok:
-            client = scope.get("client") or ("?", 0)
-            fwd = dict(scope.get("headers") or []).get(b"x-forwarded-for", b"").decode() or client[0]
-            log.warning("rejected request to %s from %s", path[:40] if not path.startswith("/k/") else "/k/***", fwd)
+            who = _client(scope)
+            if presented:
+                GUARD.bad_attempt("connector", who)
+            else:  # no token at all: internet background noise
+                log.info("rejected request to %s from %s", path[:40] if not path.startswith("/k/") else "/k/***", who)
             await asyncio.sleep(1.0)
-            body = b'{"error":"unauthorized"}'
-            await send({"type": "http.response.start", "status": 401,
-                        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
-            await send({"type": "http.response.body", "body": body})
-            return
+            return await _respond(send, 401, b'{"error":"unauthorized"}')
         return await self.app(scope, receive, send)
 
 
