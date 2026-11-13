@@ -1,0 +1,6 @@
+config.json
+connector.txt
+logs/
+history/
+.venv/
+__pycache__/
