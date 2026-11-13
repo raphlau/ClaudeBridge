@@ -1,6 +1,6 @@
-"""Claude Bridge: a small MCP server that gives Claude scoped access to chosen
-folders on this PC, start/quit control of a few desktop apps, and Claude in
-Chrome on this PC (through Claude Code's own Chrome integration).
+"""Claude Bridge: a small MCP server that gives Claude scoped access to two
+folders on this PC (Files and Notes) and Claude in Chrome on this PC (through
+Claude Code's own Chrome integration).
 
 Exposed to Claude as a custom connector via Tailscale Funnel. Every request
 must carry the secret token (Authorization: Bearer <token>, or the /k/<token>/
@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -128,13 +128,6 @@ for r in CFG["roots"]:
         raise SystemExit(f"config.json: bad root name {r['name']!r}")
     ROOTS[name.lower()] = Root(name, Path(r["path"]).expanduser(), r.get("mode", "read") == "write", r.get("sync_app", ""),
                                r.get("description", ""))
-# Old names still work in paths (e.g. 'Backups/...' after the folder was renamed to 'Files')
-ALIASES: dict[str, Root] = {}
-for r in CFG["roots"]:
-    aliases = r.get("aliases") or []
-    for a in [aliases] if isinstance(aliases, str) else aliases:
-        if a.lower() not in ROOTS:
-            ALIASES[a.lower()] = ROOTS[r["name"].strip().strip("/\\").lower()]
 
 
 class BridgeError(ToolError):
@@ -159,7 +152,7 @@ def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) ->
     if "\x00" in vpath or re.match(r"^[A-Za-z]:", vpath):
         raise BridgeError("Use paths like 'Notes/sub/file.md', not drive paths")
     head, _, rest = vpath.partition("/")
-    root = ROOTS.get(head.lower()) or ALIASES.get(head.lower())
+    root = ROOTS.get(head.lower())
     if root is None:
         raise BridgeError(f"Unknown folder {head!r}. Available: " + ", ".join(r.name for r in ROOTS.values()))
     parts = [p for p in rest.split("/") if p not in ("", ".")]
@@ -349,9 +342,7 @@ def write_atomic(real: Path, text: str, crlf: bool = False, bom: bool = False) -
     os.replace(tmp, real)
 
 
-# ---------------------------------------------------------------- desktop apps (MEGA, Obsidian, Chrome, Claude)
-
-CLAUDE_MATCH = ["\\windowsapps\\claude_", "\\anthropicclaude\\", "\\programs\\claude\\"]
+# ---------------------------------------------------------------- desktop apps the bridge starts (sync apps, Chrome)
 
 
 @dataclass
@@ -359,10 +350,8 @@ class App:
     name: str
     process: str                 # exe name, e.g. "MEGAsync.exe"
     launch: Any = None           # command list, or a URI string such as obsidian://open?vault=...
-    match: list[str] | None = None  # the exe path must contain one of these (tells the desktop app from Claude Code's CLI)
+    match: list[str] | None = None  # if set, the exe path must contain one of these
     vault: str = ""              # Obsidian: this vault must be open for Sync to upload
-    can_quit: bool = False
-    purpose: str = ""
 
 
 def _as_list(v: Any) -> list[str] | None:
@@ -372,19 +361,8 @@ def _as_list(v: Any) -> list[str] | None:
 
 
 def _load_apps() -> dict[str, App]:
-    apps: dict[str, App] = {}
-    for a in CFG.get("apps", []):
-        name = a["name"]
-        default_match = CLAUDE_MATCH if a["process"].lower() == "claude.exe" else None
-        apps[name.lower()] = App(name, a["process"], a.get("launch"), _as_list(a.get("match")) or default_match,
-                                 a.get("vault", ""), bool(a.get("can_quit", False)), a.get("purpose", ""))
-    # configs written by v1.1 used separate keys
-    for a in CFG.get("sync_apps", []):
-        apps.setdefault(a["name"].lower(), App(a["name"], a["process"], a.get("launch"), None, a.get("vault", "")))
-    old = CFG.get("claude_app") or {}
-    if old.get("launch") and "claude" not in apps:
-        apps["claude"] = App("Claude", "claude.exe", old["launch"], _as_list(old.get("exe_match")) or CLAUDE_MATCH, can_quit=True)
-    return apps
+    return {a["name"].lower(): App(a["name"], a["process"], a.get("launch"), _as_list(a.get("match")), a.get("vault", ""))
+            for a in CFG.get("apps", [])}
 
 
 APPS = _load_apps()
@@ -446,7 +424,7 @@ def app_state(app: App) -> tuple[bool, str]:
     return True, "running"
 
 
-def ensure_app(name: str, start: bool = True) -> str:
+def ensure_app(name: str) -> str:
     """Make sure an app is running (and for Obsidian, the vault is open); start it if not."""
     app = APPS.get((name or "").lower())
     if not app:
@@ -456,7 +434,7 @@ def ensure_app(name: str, start: bool = True) -> str:
     ready, state = app_state(app)
     if ready:
         return f"{app.name}: {state}"
-    if not start or not app.launch:
+    if not app.launch:
         return f"{app.name}: {state.upper() if state == 'not running' else state}"
     err = _launch(app.launch)
     if err:
@@ -537,6 +515,10 @@ def _desktop_app_clis() -> list[Path]:
         return []
 
 
+# Where the Claude desktop app keeps its own claude.exe (not Claude Code's CLI)
+DESKTOP_APP_PATHS = ["\\windowsapps\\claude_", "\\anthropicclaude\\", "\\programs\\claude\\"]
+
+
 def find_claude_code() -> str:
     """Path to Claude Code's CLI (not the desktop app, whose exe is also claude.exe), or ''.
     Order: chrome.claude_path if it still exists, a standalone install, then the copy bundled with the desktop app."""
@@ -551,7 +533,7 @@ def find_claude_code() -> str:
         cands.append(Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd")
     for c in cands:
         low = str(c).lower()
-        if any(m in low for m in CLAUDE_MATCH) or "\\microsoft\\windowsapps\\" in low:
+        if any(m in low for m in DESKTOP_APP_PATHS) or "\\microsoft\\windowsapps\\" in low:
             continue  # the desktop app or its Store alias
         if c.is_file():
             return str(c)
@@ -592,7 +574,6 @@ class ChromeLink:
         self.error = ""
         self.cli = ""
         self.since = 0.0
-        self.started_at = 0.0
         self._session: ClientSession | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._kick: asyncio.Event | None = None
@@ -620,7 +601,6 @@ class ChromeLink:
     def start(self) -> None:
         if not CHROME.get("enabled", True) or self._thread:
             return
-        self.started_at = time.time()
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="bridge-chrome", daemon=True)
         self._thread.start()
 
@@ -1379,7 +1359,7 @@ async def healthz(request: Request):
 async def download(request: Request):
     info = LINKS.get(request.path_params["token"])
     if not info or info["kind"] != "download" or info["expires"] < time.time() or not info["path"].is_file():
-        return _link_miss(request)
+        return Response(status_code=404)  # TokenGate checks links first; this is a second line
     log.info("download %s", info["display"])
     return FileResponse(info["path"], filename=info["path"].name,
                         media_type=mimetypes.guess_type(info["path"].name)[0] or "application/octet-stream")
@@ -1390,7 +1370,7 @@ async def upload(request: Request):
     tok = request.path_params["token"]
     info = LINKS.get(tok)
     if not info or info["kind"] != "upload" or info["expires"] < time.time():
-        return _link_miss(request)
+        return Response(status_code=404)  # TokenGate checks links first; this is a second line
     LINKS.pop(tok, None)  # one use
     dest: Path = info["path"]
     if dest.exists() and not info["overwrite"]:
@@ -1608,10 +1588,6 @@ async def _drop(send) -> None:
     transport.abort()
     cycle.disconnected = True  # so uvicorn doesn't send a 500 of its own
 
-
-def _link_miss(request: Request) -> Response:
-    """Unreachable in practice (TokenGate checks link tokens first); kept as a second line."""
-    return Response(status_code=404)
 
 
 def _link_ok(path: str, method: str) -> bool:

@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-  Installs Claude Bridge: a small background server that lets Claude read and edit your MEGA folder
-  and Obsidian vault on this PC (and start/quit the Claude desktop app), published through Tailscale Funnel.
+  Installs Claude Bridge: a small background server that lets Claude read and edit two folders on this PC,
+  Files (documents) and Notes, and use Chrome here; published through Tailscale Funnel.
 
 .USAGE
   Easiest, in PowerShell from the Start menu (no need for admin):
@@ -167,24 +167,6 @@ if ($cfg -and -not $Reconfigure) {
     $token = $cfg.token
     $roots = @($cfg.roots)
     if ($cfg.listen_port) { $Port = [int]$cfg.listen_port }
-    foreach ($r in $roots) {
-        # Before 1.6 the documents folder was called 'Backups'; old paths keep working through the alias
-        if ($r.name -eq 'Backups') {
-            $r.name = 'Files'
-            $r | Add-Member -NotePropertyName aliases -NotePropertyValue @('Backups') -Force
-            $h = Join-Path $InstallDir 'history\Backups'
-            if ((Test-Path -LiteralPath $h) -and -not (Test-Path -LiteralPath (Join-Path $InstallDir 'history\Files'))) {
-                Rename-Item -LiteralPath $h -NewName 'Files'
-            }
-            Say "Renamed the shared folder 'Backups' to 'Files' ('Backups/...' paths still work)."
-        }
-    }
-    # Only Files and Notes are shared; anything else is left over from older setups
-    foreach ($r in @($roots | Where-Object { @('Files', 'Notes') -notcontains $_.name })) {
-        Say "Stopped sharing the folder '$($r.name)' ($($r.path)): only Files and Notes are shared now. The folder itself is untouched." 'Yellow'
-    }
-    $roots = @($roots | Where-Object { @('Files', 'Notes') -contains $_.name })
-    if ($roots.Count -eq 0) { Fail "config.json has no Files or Notes folder; re-run the installer with -Reconfigure to pick them." }
 } else {
     Say "`nPick the two folders to share. Claude can read and add or change files there, but never delete or move anything."
     $roots = @()
@@ -212,13 +194,12 @@ if (-not $token -or $token -notmatch '^[A-Za-z0-9_-]{32,}$') {
     $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
 
-# Desktop apps the bridge can check and start: the apps that sync the shared folders (started only when Claude
-# changes something there), Chrome and Claude
+# Desktop apps the bridge starts when they're needed: the apps that sync the shared folders, and Chrome
 $apps = @()
 $wanted = @($roots | ForEach-Object { $_.sync_app })
 if ($wanted -contains 'MEGA') {
     $mega = Find-Exe 'MEGAsync' @("$env:LOCALAPPDATA\MEGAsync\MEGAsync.exe", "$env:ProgramFiles\MEGAsync\MEGAsync.exe", "${env:ProgramFiles(x86)}\MEGAsync\MEGAsync.exe")
-    if ($mega) { $apps += [ordered]@{ name = 'MEGA'; process = 'MEGAsync.exe'; launch = @($mega); can_quit = $false }; Say "Found MEGA: $mega" }
+    if ($mega) { $apps += [ordered]@{ name = 'MEGA'; process = 'MEGAsync.exe'; launch = @($mega) }; Say "Found MEGA: $mega" }
     else { Say "Couldn't find the MEGA app, which syncs Files; re-run this installer after installing it." 'Yellow' }
 }
 if ($wanted -contains 'Obsidian') {
@@ -227,7 +208,7 @@ if ($wanted -contains 'Obsidian') {
     if ($obs) {
         # Opening this link starts Obsidian if needed and opens the vault, which is what Obsidian Sync needs
         $uri = 'obsidian://open?vault=' + [Uri]::EscapeDataString((Split-Path -Leaf $vault))
-        $apps += [ordered]@{ name = 'Obsidian'; process = 'Obsidian.exe'; launch = $uri; vault = $vault; can_quit = $false }
+        $apps += [ordered]@{ name = 'Obsidian'; process = 'Obsidian.exe'; launch = $uri; vault = $vault }
         Say "Found Obsidian: $obs"
     } else { Say "Couldn't find Obsidian, which syncs Notes; re-run this installer after installing it." 'Yellow' }
 }
@@ -240,7 +221,7 @@ if (-not $chrome) { $chrome = Find-Exe 'chrome' @("$env:ProgramFiles\Google\Chro
 if ($chrome) {
     $chromeLaunch = @($chrome)
     if ($ChromeProfile) { $chromeLaunch += "--profile-directory=$ChromeProfile" }
-    $apps += [ordered]@{ name = 'Chrome'; process = 'chrome.exe'; launch = $chromeLaunch; match = @('\google\chrome\'); can_quit = $true }
+    $apps += [ordered]@{ name = 'Chrome'; process = 'chrome.exe'; launch = $chromeLaunch; match = @('\google\chrome\') }
     Say "Found Chrome: $chrome$(if ($ChromeProfile) { " (profile: $ChromeProfile)" })"
 } else { Say "Couldn't find Google Chrome; the bridge won't be able to start it." 'Yellow' }
 $cfgOut = [ordered]@{
@@ -251,13 +232,10 @@ $cfgOut = [ordered]@{
     apps        = $apps
     quiet       = $true
 }
-# Keep the settings you can change by hand (see README); drop anything else, e.g. left over from older versions.
-$settings = @('history_days', 'history_dir', 'log_dir', 'deny_folders', 'deny_files', 'deny_write_exts', 'limits', 'chrome', 'security', 'update')
-$generated = @('listen_port', 'public_url', 'token', 'roots', 'apps', 'quiet')
+# Keep the settings you added by hand (chrome, security, update, limits, deny lists...; see README)
 if ($cfg) {
     foreach ($prop in $cfg.PSObject.Properties) {
-        if ($settings -contains $prop.Name) { $cfgOut[$prop.Name] = $prop.Value }
-        elseif ($generated -notcontains $prop.Name) { Say "Removed the old setting '$($prop.Name)' from config.json (not used any more)." }
+        if (-not $cfgOut.Contains($prop.Name)) { $cfgOut[$prop.Name] = $prop.Value }
     }
 }
 Write-Utf8NoBom $cfgPath ($cfgOut | ConvertTo-Json -Depth 6)
@@ -276,16 +254,10 @@ Start-ScheduledTask -TaskName $TaskName
 
 # Daily update check (update.ps1), also started on demand by update_bridge. It runs in a headless console host:
 # with Windows Terminal as the default terminal, powershell's -WindowStyle Hidden still shows a window.
-# An update runs this installer from inside that task, so then it only adjusts the task's action in place.
-$uArgs = "--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$InstallDir\update.ps1`" -Scheduled"
-$uAction = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $uArgs -WorkingDirectory $InstallDir
-$existing = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue
-if ($Unattended -and $existing) {
-    if (@($existing.Actions)[0].Execute -ne 'conhost.exe') {
-        Set-ScheduledTask -TaskName $UpdateTaskName -Action $uAction | Out-Null
-        Say "Updates now run without a window."
-    }
-} else {
+# An update runs this installer from inside that task, so then it leaves the task alone.
+if (-not ($Unattended -and (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue))) {
+    $uArgs = "--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$InstallDir\update.ps1`" -Scheduled"
+    $uAction = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $uArgs -WorkingDirectory $InstallDir
     $uTrigger = New-ScheduledTaskTrigger -Daily -At '04:00' -RandomDelay (New-TimeSpan -Hours 2)
     $uSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew

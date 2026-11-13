@@ -1,9 +1,9 @@
 # Claude Bridge: notes for Claude Code
 
 This folder is Claude Bridge, an MCP server (Python, `server.py`) that the user (Raph) adds to Claude as a
-custom connector, so Claude can reach two folders on this Windows PC from his phone: **Files** (his documents;
-it was called "Backups" before 1.6, and that name still works as an alias) and **Notes** (Markdown notes). It also
-passes through Claude in Chrome. It's published via **Tailscale Funnel** and protected by a bearer token. See
+custom connector, so Claude can reach two folders on this Windows PC from his phone: **Files** (his documents)
+and **Notes** (Markdown notes). It also passes through Claude in Chrome. Raph runs it on two PCs (a laptop and a
+home desktop) that share the same synced folders. It's published via **Tailscale Funnel** and protected by a bearer token. See
 README.md for the design.
 
 ## Your job when asked to "set this up"
@@ -61,7 +61,8 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   on the first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
 - The tool set is deliberate (README "Tools"): don't add app-control or browser-picking tools back. Unwanted Claude in
   Chrome tools go in `CHROME_BLOCKED`, which also covers `browser_batch`.
-- Only the Files and Notes folders are shared; install.ps1 drops other roots and unknown config keys.
+- Only the Files and Notes folders are shared. Don't add migration code for old configs: both PCs are current, and
+  config clean-ups are done by hand.
 - update.ps1 must stay a no-op while the bridge is switched off (`bridge.cmd off` is the kill switch), and must
   never print the token: install.ps1 -Unattended output goes into logs\update.log.
 - Never paste the token into anything other than this machine's files or the chat with Raph.
