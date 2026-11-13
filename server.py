@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -40,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -487,9 +488,9 @@ def _background_loop() -> None:
 
 CHROME = {
     "enabled": True,
-    "claude_path": "",          # Claude Code's CLI; found automatically when empty
+    "claude_path": "",          # Claude Code's CLI; found automatically when empty (or when the path no longer exists)
     "permission_mode": "",      # "" = the extension's own site permissions; or ask / skip_all_permission_checks / follow_a_plan
-    "device_id": "",            # preferred browser (deviceId from list_connected_browsers); else Claude Code's saved choice
+    "device_id": "",            # starting choice of browser (deviceId); a browser picked later is remembered in chrome_state.json
     "call_timeout_seconds": 180,
     **(CFG.get("chrome") or {}),
 }
@@ -499,13 +500,36 @@ CHROME_BLOCKED = {"file_upload"}
 CHROME_READ_ONLY = {"read_page", "find", "get_page_text", "read_console_messages", "read_network_requests",
                     "list_connected_browsers"}
 CHROME_CACHE = BASE_DIR / "chrome_tools.json"  # last tool list, so tools/list is instant while the child starts
+CHROME_STATE = BASE_DIR / "chrome_state.json"  # the browser last used, so a choice made in chat sticks
+CHROME_PICKERS = {"select_browser", "switch_browser"}
+
+
+def _desktop_app_clis() -> list[Path]:
+    """Claude Code CLIs bundled with the Claude desktop app, newest first. The app keeps one in
+    %LOCALAPPDATA%\\Claude-Data\\claude_<id>\\claude-code\\<version>\\<build>\\claude.exe and replaces the
+    version folder when it updates, so it's looked up each time rather than saved."""
+    base = Path(os.environ.get("LOCALAPPDATA", "")) / "Claude-Data"
+
+    def key(p: Path) -> tuple:
+        try:
+            ver = tuple(int(x) for x in p.parent.parent.name.split("."))
+        except ValueError:
+            ver = ()
+        return ver, p.stat().st_mtime
+
+    try:
+        found = [p for p in base.glob("claude_*/claude-code/*/*/claude.exe") if p.is_file()]
+        return sorted(found, key=key, reverse=True)
+    except OSError:
+        return []
 
 
 def find_claude_code() -> str:
-    """Path to Claude Code's CLI (not the desktop app, whose exe is also claude.exe), or ''."""
+    """Path to Claude Code's CLI (not the desktop app, whose exe is also claude.exe), or ''.
+    Order: chrome.claude_path if it still exists, a standalone install, then the copy bundled with the desktop app."""
     want = str(CHROME.get("claude_path") or "").strip()
-    if want:
-        return want if Path(want).expanduser().is_file() else ""
+    if want and Path(want).expanduser().is_file():
+        return want
     cands = [Path.home() / ".local" / "bin" / ("claude.exe" if IS_WINDOWS else "claude")]
     found = shutil.which("claude")
     if found:
@@ -518,6 +542,9 @@ def find_claude_code() -> str:
             continue  # the desktop app or its Store alias
         if c.is_file():
             return str(c)
+    if IS_WINDOWS:
+        for c in _desktop_app_clis():
+            return str(c)
     return ""
 
 
@@ -526,6 +553,10 @@ def _err(e: BaseException) -> str:
     while isinstance(e, BaseExceptionGroup) and e.exceptions:
         e = e.exceptions[0]
     return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
+def _text(res: Any) -> str:
+    return "\n".join(c.text for c in (getattr(res, "content", None) or []) if getattr(c, "type", "") == "text")
 
 
 def _chrome_audit_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -554,8 +585,18 @@ class ChromeLink:
         self._kick: asyncio.Event | None = None
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
+        self.browser = ""              # which browser calls go to, for chrome_status
+        self._browser_ok = False
+        self._browser_checked = 0.0
+        self._cli_checked = 0.0
+        self._inflight = 0
+        self._saved: dict[str, Any] = {}
         if CHROME.get("enabled", True):
             self._load_cache()
+            try:
+                self._saved = json.loads(CHROME_STATE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
 
     # -- lifecycle (runs in the bridge-chrome thread)
 
@@ -598,8 +639,9 @@ class ChromeLink:
         mode = str(CHROME.get("permission_mode") or "").strip()
         if mode in CHROME_PERMISSION_MODES:
             env["CLAUDE_CHROME_PERMISSION_MODE"] = mode
-        if CHROME.get("device_id"):
-            env["CLAUDE_CHROME_PAIRED_DEVICE_ID"] = str(CHROME["device_id"])
+        device = self._saved.get("device_id") or CHROME.get("device_id")
+        if device:
+            env["CLAUDE_CHROME_PAIRED_DEVICE_ID"] = str(device)
         params = StdioServerParameters(command=self.cli, args=["--claude-in-chrome-mcp"], env=env, cwd=str(BASE_DIR))
         self.state = "starting"
         err_path = LOG_DIR / "chrome-mcp.log"
@@ -616,6 +658,8 @@ class ChromeLink:
                     self._session, self.error, self.state, self.since = session, "", "connected", time.time()
                     self._ready.set()
                     log.info("chrome: Claude Code's Chrome server is up (%s), %d tools", self.cli, len(self.tools))
+                    self._cli_checked = time.time()
+                    await self._settle_quietly(session)
                     while True:  # stay up; ping so a dead child is noticed
                         try:
                             await asyncio.wait_for(self._kick.wait(), 10)
@@ -625,6 +669,68 @@ class ChromeLink:
                         except TimeoutError:
                             pass
                         await asyncio.wait_for(session.send_ping(), 20)
+                        if time.time() - self._cli_checked > 1800:
+                            # The desktop app swaps its bundled CLI on update: move to the new one when idle.
+                            self._cli_checked = time.time()
+                            newer = await asyncio.to_thread(find_claude_code)
+                            if newer and os.path.normcase(newer) != os.path.normcase(self.cli) and self._inflight == 0:
+                                log.info("chrome: switching to %s", newer)
+                                return
+
+    # -- choosing the browser (runs in the bridge-chrome thread)
+
+    async def _browsers(self, session: ClientSession) -> list[dict[str, Any]]:
+        res = await asyncio.wait_for(session.call_tool("list_connected_browsers", {}), 30)
+        text = _text(res).lstrip()
+        if getattr(res, "is_error", False) or not text.startswith("["):
+            return []  # e.g. "Browser extension is not connected"
+        data, _ = json.JSONDecoder().raw_decode(text)
+        return [b for b in data if isinstance(b, dict) and b.get("deviceId")]
+
+    async def _settle(self, session: ClientSession) -> None:
+        """Make sure calls go to the right browser without anyone picking one by hand. Uses the browser in use,
+        else the one last used here, the one in config.json, or the one Claude Code knows is on this PC. A browser
+        on another computer is never picked automatically: then Claude asks, and the answer is remembered."""
+        self._browser_checked = time.time()
+        browsers = await self._browsers(session)
+        if not browsers:
+            self._browser_ok, self.browser = False, "none connected (is Chrome running with the extension?)"
+            return
+        pick, why = next((b for b in browsers if b.get("inUse")), None), "in use"
+        if not pick:
+            by_id = {b["deviceId"]: b for b in browsers}
+            local = [b["deviceId"] for b in browsers if b.get("onThisComputer")]
+            for cand, reason in ((self._saved.get("device_id"), "used last"), (CHROME.get("device_id"), "set in config.json"),
+                                 (local[0] if len(local) == 1 else "", "on this PC")):
+                if cand and cand in by_id:
+                    pick, why = by_id[cand], reason
+                    break
+            if not pick:
+                self._browser_ok = False
+                self.browser = (f"not chosen: {len(browsers)} connected, none known to be this PC's. "
+                                "Ask Raph which one, then call select_browser; the bridge remembers it.")
+                return
+            res = await asyncio.wait_for(session.call_tool("select_browser", {"deviceId": pick["deviceId"]}), 30)
+            if getattr(res, "is_error", False):
+                self._browser_ok, self.browser = False, f"couldn't select {pick.get('name')}: {_text(res)[:200]}"
+                log.warning("chrome: %s", self.browser)
+                return
+            log.info("chrome: selected browser %s (%s, %s)", pick.get("name"), pick["deviceId"], why)
+        self._browser_ok = True
+        self.browser = f"{pick.get('name') or '?'} ({pick['deviceId'][:8]}..., {why})"
+        if pick["deviceId"] != self._saved.get("device_id"):
+            self._saved = {"device_id": pick["deviceId"], "name": pick.get("name", ""), "saved": fmt_time(time.time())}
+            try:
+                CHROME_STATE.write_text(json.dumps(self._saved), encoding="utf-8")
+            except OSError as e:
+                log.warning("chrome: couldn't save the browser choice: %s", e)
+
+    async def _settle_quietly(self, session: ClientSession) -> None:
+        try:
+            await self._settle(session)
+        except Exception as e:  # noqa: BLE001 - never let this take the link down
+            self._browser_ok, self.browser = False, f"couldn't check ({_err(e)})"
+            log.warning("chrome: browser check failed: %s", _err(e))
 
     def restart(self) -> None:
         if self._loop and self._kick:
@@ -677,10 +783,19 @@ class ChromeLink:
             if session is None or loop is None:
                 raise BridgeError(f"Claude in Chrome isn't reachable through the bridge right now ({self.error or self.state}). "
                                   "Call chrome_status for details.")
+            # Re-check the browser choice now and then (Chrome restarted, extension reinstalled...).
+            age = time.time() - self._browser_checked
+            if name not in CHROME_PICKERS and ((not self._browser_ok and age > 30) or age > 900):
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
             sent = time.time()
             fut = asyncio.run_coroutine_threadsafe(session.call_tool(name, arguments, read_timeout_seconds=timeout), loop)
+            self._inflight += 1
             try:
-                return await asyncio.wrap_future(fut)
+                result = await asyncio.wrap_future(fut)
+                if name in CHROME_PICKERS and not getattr(result, "is_error", False):
+                    # Remember the browser Raph picked, so the next chat doesn't have to ask.
+                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
+                return result
             except Exception as e:  # noqa: BLE001 - a transport failure or timeout, not a tool error
                 log.warning("chrome: %s failed: %s", name, _err(e))
                 # The child died between pings: restart it. Retry only if the call failed at once,
@@ -692,6 +807,8 @@ class ChromeLink:
                         await asyncio.sleep(1)
                         continue
                 raise BridgeError(f"The Chrome call didn't complete ({_err(e)}). Call chrome_status, then retry.") from None
+            finally:
+                self._inflight -= 1
         raise BridgeError("The Chrome call didn't complete. Call chrome_status, then retry.")
 
     def describe(self) -> str:
@@ -707,6 +824,11 @@ class ChromeLink:
             f"Claude Code: {self.cli or find_claude_code() or 'not found'}",
             "Site permissions: " + (mode if mode in CHROME_PERMISSION_MODES else "the extension's own settings"),
         ]
+        if self.state == "connected":
+            lines.insert(1, f"Browser: {self.browser or 'not checked yet'}")
+        want = str(CHROME.get("claude_path") or "").strip()
+        if want and not Path(want).expanduser().is_file():
+            lines.append(f"Note: chrome.claude_path in config.json no longer exists ({want}); found Claude Code by itself instead.")
         chrome_app = APPS.get("chrome")
         if chrome_app and IS_WINDOWS:
             lines.append(f"Chrome: {app_state(chrome_app)[1]}")
@@ -731,8 +853,10 @@ app_status / start_app / quit_app manage MEGA, Obsidian, Chrome and the Claude d
 Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer, read_page, find, get_page_text...) are
 Claude in Chrome, run through Claude Code on the PC, so they work from any chat, linked or not, without the Claude app.
 Start with tabs_context_mcp(createIfEmpty=true) and work in your own tab. If a call says Chrome or the extension isn't
-connected, call start_app('Chrome'), wait a few seconds and retry; chrome_status shows what's wrong. If several browsers
-are listed, the one on this PC is the one list_connected_browsers marks as on this computer. file_upload is not available."""
+connected, call start_app('Chrome'), wait a few seconds and retry; chrome_status shows what's wrong. The bridge picks
+this PC's browser by itself; if list_connected_browsers says none is selected, ask Raph which one, then call
+select_browser (the bridge remembers it). file_upload is not available.
+update_bridge checks for a newer version of the bridge and can install it; it also updates itself once a day."""
 
 
 class BridgeServer(MCPServer):
@@ -1104,6 +1228,80 @@ async def chrome_status(restart: bool = False) -> str:
         await asyncio.sleep(2)
         await asyncio.to_thread(CHROME_LINK._ready.wait, 20)
     return CHROME_LINK.describe()
+
+
+# ---------------------------------------------------------------- updates
+#
+# Releases are published to a public repo (the source repo is private). The 'ClaudeBridge Update' scheduled task
+# runs update.ps1 once a day; update_bridge(install=True) asks it to run now. update.ps1 downloads the release,
+# checks its SHA-256, runs its installer unattended and puts the old files back if the new version doesn't start.
+
+UPDATE = {"auto": True, "repo": "raphlau/ClaudeBridge-releases", **(CFG.get("update") or {})}
+UPDATE_TASK = "ClaudeBridge Update"
+UPDATE_STATE = BASE_DIR / "update_state.json"      # written by update.ps1
+UPDATE_REQUEST = BASE_DIR / "update_request.json"  # read (and deleted) by update.ps1
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except ValueError:
+        return ()
+
+
+def latest_release() -> str:
+    url = f"https://github.com/{UPDATE['repo']}/releases/latest/download/version.txt"
+    req = urllib.request.Request(url, headers={"User-Agent": f"ClaudeBridge/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read(64).decode("utf-8", "replace").strip()
+
+
+@mcp.tool(annotations=WR)
+async def update_bridge(install: bool = False, reinstall: bool = False) -> str:
+    """Check whether a newer version of Claude Bridge is out. install=True upgrades the bridge on the PC to the latest
+    release (about a minute; this connection drops while it restarts, then call update_bridge() again to see the
+    result). reinstall=True reinstalls the latest release even if it's already running. The PC also checks and
+    installs updates by itself once a day."""
+    audit("update_bridge", install=install, reinstall=reinstall)
+    err = ""
+    try:
+        latest = await asyncio.to_thread(latest_release)
+        if not _version_tuple(latest):
+            err, latest = f"unexpected answer {latest[:20]!r}", ""
+    except Exception as e:  # noqa: BLE001 - offline, GitHub down, no release yet
+        latest, err = "", _err(e)
+    try:
+        last = json.loads(UPDATE_STATE.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        last = {}
+    newer = bool(latest) and _version_tuple(latest) > _version_tuple(VERSION)
+    lines = [
+        f"Running: {VERSION}",
+        f"Latest release: {latest + (' (newer)' if newer else '') if latest else 'unknown (' + err + ')'}",
+        "Daily automatic update: " + ("on" if UPDATE.get("auto", True) else "off (\"update\": {\"auto\": false} in config.json)"),
+    ]
+    if last:
+        lines.append(f"Last update run: {last.get('at', '?')}: {last.get('result', '?')}"
+                     + (f" ({last['detail']})" if last.get("detail") else ""))
+    if not (install or reinstall):
+        if newer:
+            lines.append("Call update_bridge(install=True) to install it now.")
+        return "\n".join(lines)
+    if not IS_WINDOWS:
+        raise BridgeError("Updating only works on Windows")
+    if not latest:
+        raise BridgeError(f"Couldn't check the releases page ({err}), so nothing was installed.")
+    if not newer and not reinstall:
+        return "\n".join(lines + ["Already up to date; nothing to install."])
+    UPDATE_REQUEST.write_text(json.dumps({"reinstall": reinstall, "at": fmt_time(time.time())}), encoding="utf-8")
+    r = await asyncio.to_thread(subprocess.run, ["schtasks", "/Run", "/TN", UPDATE_TASK], capture_output=True, text=True,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        UPDATE_REQUEST.unlink(missing_ok=True)
+        raise BridgeError(f"Couldn't start the '{UPDATE_TASK}' task ({(r.stderr or r.stdout).strip()}). "
+                          "Raph needs to run the installer on the PC once to set it up.")
+    return (f"{'Reinstalling' if not newer else 'Updating to'} {latest}. The bridge restarts in about a minute, so this "
+            "connection will drop; then call update_bridge() to see the result.")
 
 
 # ---------------------------------------------------------------- HTTP routes (links, health)

@@ -1,0 +1,62 @@
+# Builds a release when a version tag is pushed (git tag v1.4.0 && git push origin v1.4.0).
+# The tag must match VERSION in server.py. The release is published here (private, with a changelog) and to the
+# public downloads repo, which is where get.ps1 and update.ps1 download from. That needs the RELEASES_TOKEN secret:
+# a fine-grained token with Contents read/write on the downloads repo only.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  PUBLIC_REPO: raphlau/ClaudeBridge-releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version and scripts
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -nE 's/^VERSION = "([0-9.]+)"\r?$/\1/p' server.py)"
+          if [ "$tag" != "$ver" ]; then echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION \"$ver\" in server.py"; exit 1; fi
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' *.ps1 *.cmd; then echo "::error::.ps1/.cmd files must be ASCII-only (Windows PowerShell 5.1)"; exit 1; fi
+          python3 -m py_compile server.py selftest.py
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir dist
+          zip -X -j dist/ClaudeBridge.zip server.py selftest.py pyproject.toml uv.lock install.ps1 install.cmd \
+            update.ps1 bridge.ps1 bridge.cmd config.example.json README.md CLAUDE.md
+          (cd dist && sha256sum ClaudeBridge.zip | cut -d' ' -f1 > ClaudeBridge.zip.sha256)
+          printf '%s\n' "$VERSION" > dist/version.txt
+          cp get.ps1 dist/get.ps1
+          install='irm https://github.com/'"$PUBLIC_REPO"'/releases/latest/download/get.ps1 | iex'
+          {
+            echo "Install or update on Windows, in PowerShell opened from the Start menu:"
+            echo; echo '```powershell'; echo "$install"; echo '```'
+          } > public-notes.md
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          { cat public-notes.md; echo; echo "Changes:"; git log --no-merges --pretty='- %s' ${prev:+$prev..}"$GITHUB_REF_NAME"; } > notes.md
+
+      - name: Release in this repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Claude Bridge $VERSION" --notes-file notes.md
+
+      - name: Release in the public downloads repo
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "::error::Add the RELEASES_TOKEN secret (a token that can write to $PUBLIC_REPO)"; exit 1; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$PUBLIC_REPO" --title "Claude Bridge $VERSION" --notes-file public-notes.md

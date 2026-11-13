@@ -4,22 +4,27 @@
   and Obsidian vault on this PC (and start/quit the Claude desktop app), published through Tailscale Funnel.
 
 .USAGE
-  From the unzipped folder, in a normal PowerShell window (no need for admin):
+  Easiest, in PowerShell from the Start menu (no need for admin):
+    irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex
+  Or from an unzipped release folder:
     powershell -ExecutionPolicy Bypass -File .\install.ps1
 
   Re-run any time to update the code. Add -Reconfigure to choose folders again,
   and -ChromeProfile 'Profile 1' if Claude in Chrome is in a non-default Chrome profile.
+  -Unattended is used by update.ps1: no questions, and it needs an existing config.json.
 #>
 [CmdletBinding()]
 param(
     [int]$Port = 8765,
     [string]$InstallDir = "$env:LOCALAPPDATA\ClaudeBridge",
     [switch]$Reconfigure,
-    [string]$ChromeProfile = ''   # e.g. 'Profile 1' if Claude in Chrome lives in a non-default Chrome profile
+    [string]$ChromeProfile = '',   # e.g. 'Profile 1' if Claude in Chrome lives in a non-default Chrome profile
+    [switch]$Unattended
 )
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'ClaudeBridge'
+$UpdateTaskName = 'ClaudeBridge Update'
 function Say([string]$msg, [string]$color = 'Cyan') { Write-Host $msg -ForegroundColor $color }
 function Fail([string]$msg) { Write-Host "`nERROR: $msg" -ForegroundColor Red; exit 1 }
 function Write-Utf8NoBom([string]$path, [string]$text) {
@@ -31,9 +36,33 @@ function Lock-File([string]$path) {
     icacls $path /inheritance:r /grant:r "${me}:(M)" "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
 }
 
+function Test-AppDataRedirected {
+    # Apps from the Microsoft Store (such as the Claude desktop app) can run the programs they start with AppData
+    # writes redirected into the app's own storage. Installed there, the bridge would be invisible to its
+    # background task. Check by writing a probe folder and looking for it in the apps' storage.
+    $probe = 'cb-probe-' + [guid]::NewGuid().ToString('N')
+    $p = Join-Path $env:LOCALAPPDATA $probe
+    try {
+        New-Item -ItemType Directory -Path $p -ErrorAction Stop | Out-Null
+        $pk = Join-Path $env:LOCALAPPDATA 'Packages'
+        $hit = @(Get-ChildItem -LiteralPath $pk -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "LocalCache\Local\$probe") })
+        return ($hit.Count -gt 0)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $Src = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-Say "Claude Bridge installer`n"
+Say "Claude Bridge installer$(if ($Unattended) { ' (unattended)' })`n"
+if ($Unattended -and $Reconfigure) { Fail "-Unattended can't be combined with -Reconfigure." }
+if (-not $Unattended -and (Test-AppDataRedirected)) {
+    Fail ("This window runs inside another app (probably the Claude desktop app), which redirects AppData. " +
+          "Open PowerShell from the Start menu and run the install command there.")
+}
 
 # ---------------------------------------------------------------- Tailscale
 $ts = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
@@ -59,7 +88,7 @@ if (-not $uv) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $InstallDir = (Resolve-Path $InstallDir).Path
 if ((Resolve-Path $Src).Path -ne $InstallDir) {
-    foreach ($f in 'server.py', 'pyproject.toml', 'uv.lock', 'bridge.ps1', 'bridge.cmd', 'README.md', 'config.example.json', 'selftest.py', 'CLAUDE.md') {
+    foreach ($f in 'server.py', 'pyproject.toml', 'uv.lock', 'bridge.ps1', 'bridge.cmd', 'update.ps1', 'README.md', 'config.example.json', 'selftest.py', 'CLAUDE.md') {
         Copy-Item -LiteralPath (Join-Path $Src $f) -Destination $InstallDir -Force
     }
 }
@@ -100,6 +129,7 @@ $cfg = $null
 if (Test-Path $cfgPath) {
     try { $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json } catch { Say "Existing config.json couldn't be read; starting fresh." 'Yellow' }
 }
+if ($Unattended -and -not $cfg) { Fail "No usable config.json in $InstallDir; run the installer by hand once first." }
 if ($cfg -and -not $Reconfigure) {
     Say "`nKeeping your existing config.json (re-run with -Reconfigure to choose folders again)."
     $token = $cfg.token
@@ -191,6 +221,19 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
     -Description 'Claude Bridge: scoped folder access for Claude via Tailscale Funnel' -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
+# Daily update check (update.ps1), also started on demand by update_bridge. An update runs this installer from
+# inside that task, so it leaves an existing update task alone.
+if (-not ($Unattended -and (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue))) {
+    $uArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallDir\update.ps1`" -Scheduled"
+    $uAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $uArgs -WorkingDirectory $InstallDir
+    $uTrigger = New-ScheduledTaskTrigger -Daily -At '04:00' -RandomDelay (New-TimeSpan -Hours 2)
+    $uSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $UpdateTaskName -Action $uAction -Trigger $uTrigger -Principal $principal -Settings $uSettings `
+        -Description 'Claude Bridge: installs new releases (daily, and when Claude calls update_bridge)' -Force | Out-Null
+    Say "Registered the daily update task '$UpdateTaskName'."
+}
+
 $ok = $false
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
@@ -228,7 +271,13 @@ $(($roots | ForEach-Object { "  $($_.name)  ($($_.mode))  $($_.path)" }) -join "
 $sumPath = Join-Path $InstallDir 'connector.txt'
 Write-Utf8NoBom $sumPath $summary
 Lock-File $sumPath
+if ($Unattended) {
+    # The update log keeps this output, so don't print the token
+    Say "Claude Bridge is installed and running; connector details unchanged (in $sumPath)."
+    exit 0
+}
 Write-Host ""
 Write-Host $summary -ForegroundColor Green
 if (-not $public) { Say "`nThe public address isn't answering yet. New Funnel names can take up to 10 minutes; check later with: .\bridge.cmd status" 'Yellow' }
-Say "`nThis summary is saved in $sumPath. Manage the bridge with $InstallDir\bridge.cmd (status, on, off, logs, rotate-token, uninstall)."
+Say "`nThis summary is saved in $sumPath. Manage the bridge with $InstallDir\bridge.cmd (status, on, off, logs, update, rotate-token, uninstall)."
+Say "Updates install by themselves once a day (or ask Claude to run update_bridge)."

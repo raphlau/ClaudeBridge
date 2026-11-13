@@ -21,10 +21,29 @@ phone. It's published via **Tailscale Funnel** and protected by a bearer token. 
 5. Give Raph the connector URL and header from `%LOCALAPPDATA%\ClaudeBridge\connector.txt`. Remind him to add
    the `*.ts.net` name to Claude's network allowlist so download/upload links work.
 
-## Updating an existing install
+## Installing and updating
 
-Unzip the new version and run `install.ps1` from it. It keeps config.json (folders, token, extra settings),
-re-detects the apps, restarts the task, and leaves Funnel as is. Then run the self-test.
+- Installs and updates must not run from a Claude desktop app session: it redirects new AppData writes into the app's
+  own storage, where the scheduled tasks can't see them. install.ps1 detects this and refuses. Raph runs the
+  one-liner from PowerShell opened from the Start menu:
+  `irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex`
+- Updates run inside the `ClaudeBridge Update` scheduled task, which runs outside the app, so they're safe to start
+  from anywhere: `bridge.cmd update`, or the `update_bridge` MCP tool (`install=True`, or `reinstall=True` to
+  reinstall the same version). update.ps1 downloads the release, checks its SHA-256, runs
+  `install.ps1 -Unattended`, checks /healthz and rolls back from `previous\` if needed. The log is
+  `logs\update.log`; the last result is in `update_state.json`.
+- Read-only checks (selftest.py, `bridge.cmd status`) and `bridge.cmd restart` are fine from a session. To change
+  config.json from a session, edit the existing file in place (rewriting it as a new file gets redirected).
+
+## Releasing
+
+The source repo (raphlau/ClaudeBridge) is private. Releases go to the public raphlau/ClaudeBridge-releases repo via
+`.github/workflows/release.yml`.
+1. Bump `VERSION` in server.py and commit.
+2. Tag `v<VERSION>` and push the tag.
+3. The workflow refuses a tag that doesn't match `VERSION`, and fails on non-ASCII .ps1/.cmd files. Publishing to the
+   public repo needs the `RELEASES_TOKEN` Actions secret.
+4. Add any new file the install needs to both the workflow's zip list and install.ps1's copy list.
 
 ## Rules
 
@@ -32,7 +51,11 @@ re-detects the apps, restarts the task, and leaves Funnel as is. Then run the se
   or move tools, MEGA/Obsidian can't be quit, `.obsidian`/`.git`/keys hidden, history copy before every change. Don't add a shell or delete tool.
 - Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
   Keep `file_upload` blocked, including inside `browser_batch`, and don't log the text Claude types. `chrome_status`
-  shows the link state; the child's stderr goes to `logs\chrome-mcp.log`.
+  shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
+  (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
+  self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
+- update.ps1 must stay a no-op while the bridge is switched off (`bridge.cmd off` is the kill switch), and must
+  never print the token: install.ps1 -Unattended output goes into logs\update.log.
 - Never paste the token into anything other than this machine's files or the chat with Raph.
 - Windows PowerShell 5.1 compatibility matters (no `&&`, `??`, ternaries); keep .ps1 files ASCII-only.
 - After changing `server.py`, restart with `bridge.cmd restart` and re-run the self-test.

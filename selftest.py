@@ -46,6 +46,9 @@ async def check(base: str) -> bool:
                 res = await s.call_tool("chrome_status", {})
                 n_chrome = len([t for t in tools if t in ("navigate", "computer", "read_page", "tabs_context_mcp")])
                 print(f"\nchrome_status (browser tools listed: {'yes' if n_chrome == 4 else 'no'}):\n{text_of(res)}")
+                # Only checks for a newer release (installs nothing); reported, doesn't fail the test.
+                res = await s.call_tool("update_bridge", {})
+                print(f"\nupdate_bridge{' [ERROR]' if res.is_error else ''}:\n{text_of(res)}")
                 for root in [r["name"] for r in CFG["roots"]]:
                     res = await s.call_tool("list_dir", {"path": root, "max_entries": 8})
                     ok &= not res.is_error

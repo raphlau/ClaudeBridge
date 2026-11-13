@@ -6,15 +6,17 @@
     .\bridge.cmd on            start the server and publish it again
     .\bridge.cmd restart       restart the server (after editing config.json)
     .\bridge.cmd logs          last 60 log lines (every tool call is logged)
+    .\bridge.cmd update        install the latest release now (it also happens by itself once a day)
     .\bridge.cmd test          run the server in this window to see startup errors
     .\bridge.cmd rotate-token  make a new secret (update the connector in Claude afterwards)
-    .\bridge.cmd uninstall     remove the task and the Funnel (leaves this folder for you to delete)
+    .\bridge.cmd uninstall     remove the tasks and the Funnel (leaves this folder for you to delete)
 #>
-param([Parameter(Position = 0)][ValidateSet('status', 'on', 'off', 'restart', 'logs', 'test', 'rotate-token', 'uninstall')][string]$Command = 'status')
+param([Parameter(Position = 0)][ValidateSet('status', 'on', 'off', 'restart', 'logs', 'update', 'test', 'rotate-token', 'uninstall')][string]$Command = 'status')
 
 $ErrorActionPreference = 'Stop'
 $Dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TaskName = 'ClaudeBridge'
+$UpdateTaskName = 'ClaudeBridge Update'
 $cfgPath = Join-Path $Dir 'config.json'
 $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
 $Port = [int]$cfg.listen_port
@@ -34,7 +36,16 @@ function Stop-Server {
 switch ($Command) {
     'status' {
         $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $ver = Select-String -LiteralPath (Join-Path $Dir 'server.py') -Pattern '^VERSION = "([0-9.]+)"' -List
+        Write-Host "Version:       $(if ($ver) { $ver.Matches[0].Groups[1].Value } else { '?' })"
         Write-Host "Task:          $(if ($t) { $t.State } else { 'not installed' })"
+        $upd = Join-Path $Dir 'update_state.json'
+        if (Test-Path -LiteralPath $upd) {
+            $u = Get-Content -LiteralPath $upd -Raw | ConvertFrom-Json
+            Write-Host "Last update:   $($u.at): $($u.result)$(if ($u.detail) { " ($($u.detail))" })"
+        } elseif (-not (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue)) {
+            Write-Host "Last update:   no update task (re-run the installer to set it up)"
+        }
         Write-Host "Local server:  $(if (Health "$target/healthz") { 'OK' } else { 'NOT responding' })"
         Write-Host "Public URL:    $($cfg.public_url)  ->  $(if (Health "$($cfg.public_url)/healthz") { 'OK' } else { 'NOT reachable' })"
         Write-Host "Claude app:    $(if (Get-Process -Name claude -ErrorAction SilentlyContinue) { 'running' } else { 'not running' })"
@@ -56,6 +67,21 @@ switch ($Command) {
         Write-Host "Local server: $(if (Health "$target/healthz") { 'OK' } else { 'not responding; try .\bridge.cmd test' })"
     }
     'logs' { Get-Content -LiteralPath (Join-Path $Dir 'logs\bridge.log') -Tail 60 }
+    'update' {
+        # Runs update.ps1 through its scheduled task, so it works the same from any window
+        if (-not (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue)) {
+            Write-Host "The update task isn't set up; run the installer once." -ForegroundColor Yellow
+            break
+        }
+        $log = Join-Path $Dir 'logs\update.log'
+        $before = 0
+        if (Test-Path -LiteralPath $log) { $before = @(Get-Content -LiteralPath $log).Count }
+        Start-ScheduledTask -TaskName $UpdateTaskName
+        Write-Host 'Checking for updates...'
+        Start-Sleep -Seconds 2
+        for ($i = 0; $i -lt 600 -and (Get-ScheduledTask -TaskName $UpdateTaskName).State -eq 'Running'; $i++) { Start-Sleep -Seconds 1 }
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log | Select-Object -Skip $before | Where-Object { $_ -notlike '    *' } }
+    }
     'test' {
         Stop-Server
         Write-Host "Running in the foreground; press Ctrl+C to stop, then run .\bridge.cmd on" -ForegroundColor Yellow
@@ -74,6 +100,7 @@ switch ($Command) {
         & $ts funnel --https=443 $target off
         Stop-Server
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host "Removed the task and the Funnel. Delete $Dir to remove everything, and remove the connector in Claude." -ForegroundColor Yellow
+        Unregister-ScheduledTask -TaskName $UpdateTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "Removed the tasks and the Funnel. Delete $Dir to remove everything, and remove the connector in Claude." -ForegroundColor Yellow
     }
 }
