@@ -74,7 +74,10 @@ switch ($Command) {
             }
         } catch { $pub = "couldn't check ($($_.Exception.Message))" }
         Write-Host "From internet: $pub"
-        Write-Host "Claude app:    $(if (Get-Process -Name claude -ErrorAction SilentlyContinue) { 'running' } else { 'not running' })"
+        foreach ($r in @($cfg.roots)) {
+            Write-Host ("Folder:        {0} -> {1} ({2}{3})" -f $r.name, $r.path, $(if ($r.mode -eq 'write') { 'writable' } else { 'read-only' }),
+                $(if (Test-Path -LiteralPath $r.path) { '' } else { ', MISSING' }))
+        }
         Write-Host "`nFunnel:"; & $ts funnel status
     }
     'off' {

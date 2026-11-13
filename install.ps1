@@ -179,6 +179,12 @@ if ($cfg -and -not $Reconfigure) {
             Say "Renamed the shared folder 'Backups' to 'Files' ('Backups/...' paths still work)."
         }
     }
+    # Only Files and Notes are shared; anything else is left over from older setups
+    foreach ($r in @($roots | Where-Object { @('Files', 'Notes') -notcontains $_.name })) {
+        Say "Stopped sharing the folder '$($r.name)' ($($r.path)): only Files and Notes are shared now. The folder itself is untouched." 'Yellow'
+    }
+    $roots = @($roots | Where-Object { @('Files', 'Notes') -contains $_.name })
+    if ($roots.Count -eq 0) { Fail "config.json has no Files or Notes folder; re-run the installer with -Reconfigure to pick them." }
 } else {
     Say "`nPick the two folders to share. Claude can read and add or change files there, but never delete or move anything."
     $roots = @()
@@ -237,12 +243,6 @@ if ($chrome) {
     $apps += [ordered]@{ name = 'Chrome'; process = 'chrome.exe'; launch = $chromeLaunch; match = @('\google\chrome\'); can_quit = $true }
     Say "Found Chrome: $chrome$(if ($ChromeProfile) { " (profile: $ChromeProfile)" })"
 } else { Say "Couldn't find Google Chrome; the bridge won't be able to start it." 'Yellow' }
-$app = Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1
-if ($app) {
-    $apps += [ordered]@{ name = 'Claude'; process = 'claude.exe'; launch = @('explorer.exe', "shell:AppsFolder\$($app.AppID)"); can_quit = $true }
-    Say "Found the Claude app ($($app.AppID))."
-} else { Say "Couldn't find the Claude desktop app in the Start menu; re-run this installer after installing it." 'Yellow' }
-
 $cfgOut = [ordered]@{
     listen_port = $Port
     public_url  = "https://$dns"
@@ -251,10 +251,13 @@ $cfgOut = [ordered]@{
     apps        = $apps
     quiet       = $true
 }
-# keep any other settings you added by hand (deny lists, history_days, limits, chrome, update...)
+# Keep the settings you can change by hand (see README); drop anything else, e.g. left over from older versions.
+$settings = @('history_days', 'history_dir', 'log_dir', 'deny_folders', 'deny_files', 'deny_write_exts', 'limits', 'chrome', 'security', 'update')
+$generated = @('listen_port', 'public_url', 'token', 'roots', 'apps', 'quiet')
 if ($cfg) {
     foreach ($prop in $cfg.PSObject.Properties) {
-        if ($prop.Name -notin @('listen_port', 'public_url', 'token', 'roots', 'apps', 'sync_apps', 'claude_app', 'quiet')) { $cfgOut[$prop.Name] = $prop.Value }
+        if ($settings -contains $prop.Name) { $cfgOut[$prop.Name] = $prop.Value }
+        elseif ($generated -notcontains $prop.Name) { Say "Removed the old setting '$($prop.Name)' from config.json (not used any more)." }
     }
 }
 Write-Utf8NoBom $cfgPath ($cfgOut | ConvertTo-Json -Depth 6)

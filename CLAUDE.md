@@ -46,7 +46,7 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
 ## Rules
 
 - Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no delete
-  or move tools, sync apps can't be quit, `.obsidian`/`.git`/keys hidden, history copy before every change,
+  or move tools, no app-control tools, `.obsidian`/`.git`/keys hidden, history copy before every change,
   no writing programs/scripts/shortcuts (`DENY_WRITE_EXTS`), uploads get Mark-of-the-Web, wrong-token lockout
   (`Guard`). Don't add a shell or delete tool. Never let attacker-controlled text (headers, paths) reach a
   command line: `send_alert` passes the toast XML via an environment variable for that reason.
@@ -55,9 +55,13 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
   (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
   self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
-- The server must not do anything by itself while unused: no timers or watchers. MEGA/Obsidian are only checked and
-  started by write tools (`ensure_for`), history is pruned from `keep_history`, and the Chrome child starts on the
-  first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
+- The server must not do anything by itself while unused: no timers or watchers. Sync apps (MEGA/Obsidian) are
+  started when a file tool touches their folder (`sync_for_read` via `resolve`, `ensure_for` on writes), Chrome when a
+  Chrome tool needs it (`ChromeLink._start_chrome`), history is pruned from `keep_history`, and the Chrome child starts
+  on the first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
+- The tool set is deliberate (README "Tools"): don't add app-control or browser-picking tools back. Unwanted Claude in
+  Chrome tools go in `CHROME_BLOCKED`, which also covers `browser_batch`.
+- Only the Files and Notes folders are shared; install.ps1 drops other roots and unknown config keys.
 - update.ps1 must stay a no-op while the bridge is switched off (`bridge.cmd off` is the kill switch), and must
   never print the token: install.ps1 -Unattended output goes into logs\update.log.
 - Never paste the token into anything other than this machine's files or the chat with Raph.

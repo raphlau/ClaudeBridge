@@ -5,7 +5,7 @@ Lets Claude, from any device (phone included), reach two folders on your Windows
 - **Files**: your documents (papers, scans, letters, office files...)
 - **Notes**: your Markdown notes
 
-It can also use **Chrome on the PC**, and start or close Chrome and the Claude desktop app. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
+It can also use **Chrome on the PC**. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
 
 ## Install
 
@@ -29,9 +29,41 @@ At the end it shows the connector details, also saved in `%LOCALAPPDATA%\ClaudeB
 - **URL:** `https://<your-pc>.<tailnet>.ts.net/k/<token>/mcp`, the first URL in `connector.txt`. It contains the secret, and each PC has its own. Without the `/k/<token>` part, Claude tries an OAuth sign-in and reports that it can't connect.
 - **Header instead:** if a client lets you set request headers, `https://<your-pc>.<tailnet>.ts.net/mcp` with `Authorization: Bearer <token>` also works.
 
-In the connector's tool permissions, consider "ask before running" for the tools that change things: `write_text`, `edit_text`, `append_text`, `create_upload_link`, `start_app`, `quit_app`, and the Chrome tools that click, type, navigate or run scripts (`computer`, `form_input`, `navigate`, `javascript_tool`, `browser_batch`).
+Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 **Download and upload links** (for big or binary files) need your PC's `*.ts.net` name in Claude's network allowlist.
+
+## Tools
+
+27 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
+
+| Tool | What it does | Suggested |
+|---|---|---|
+| `list_dir` | list a folder, or the shared folders | Allow |
+| `find_files` | find files by name | Allow |
+| `search_text` | search inside text files | Allow |
+| `read_text` | read a text file | Allow |
+| `read_pdf` | read a PDF's text | Allow |
+| `view_file` | see an image or a PDF page | Allow |
+| `create_download_link` | short-lived link to fetch one file into Claude's workspace | Allow |
+| `write_text` | create a file, or replace one when asked | Ask |
+| `edit_text` | replace a passage in a file | Ask |
+| `append_text` | add to the end of a file | Ask |
+| `make_folder` | create a folder | Ask |
+| `create_upload_link` | one-time link to put a file from Claude's workspace onto the PC | Ask |
+| `chrome_status` | Chrome link status; picks the browser if the bridge can't tell | Allow |
+| `update_bridge` | check for a new version, or install it | Ask |
+| `tabs_context_mcp` | list Claude's tabs (can open its own tab group) | Allow |
+| `tabs_create_mcp` / `tabs_close_mcp` | open / close a tab in Claude's tab group | Allow |
+| `read_page` / `find` / `get_page_text` | read the page | Allow |
+| `read_console_messages` / `read_network_requests` | page console and network log | Allow |
+| `navigate` | go to a URL | Ask |
+| `computer` | click, type, scroll, take screenshots | Ask |
+| `form_input` | fill in form fields | Ask |
+| `javascript_tool` | run JavaScript in the page | Ask |
+| `browser_batch` | several of the above in one go | Ask |
+
+Not offered: `file_upload`, `upload_image`, `gif_creator`, `resize_window`, `list_connected_browsers`, `select_browser` and `switch_browser`. The bridge picks the browser itself, and nothing gets uploaded to websites from the PC.
 
 ## What keeps it safe
 
@@ -92,8 +124,8 @@ The bridge runs the Claude in Chrome server that comes with **Claude Code**, and
 
 - **Claude Code:** found automatically: a standalone install, or the copy inside the Claude desktop app, which it follows across app updates.
 - **Sign in once:** in PowerShell from the Start menu, run that `claude.exe` and type `/login`, using the same account as the Chrome extension. For the app's copy, the path is `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<version>\<build>\claude.exe`.
-- **On demand:** the Chrome server starts on the first Chrome call (a few seconds) and stops after 10 minutes without one.
-- **Which browser:** the one in use, or the one used last here, or the one Claude Code knows is on this PC. It never picks a browser on another computer by itself. Then Claude asks you, and the answer is remembered.
+- **On demand:** on the first Chrome call, the bridge starts Chrome if it isn't running, then the Chrome server (a few seconds). It stops the server after 10 minutes without a Chrome call.
+- **Which browser:** the one in use, or the one used last here, or the one Claude Code knows is on this PC. It never picks a browser on another computer by itself. If it can't tell, Claude asks you and calls `chrome_status(browser=...)`, and your answer is remembered.
 - **Site permissions:** the extension's own settings apply. If a site isn't allowed, the extension asks in Chrome on the PC, so allow the sites you use in the extension beforehand.
 
 **Settings** (under `"chrome"`): `enabled`, `idle_minutes`, `device_id`, `permission_mode`, `call_timeout_seconds`, `claude_path`.
@@ -126,7 +158,7 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 ## Good to know
 
-- **Sync apps:** if Files is synced by MEGA or Notes is Obsidian, the bridge starts that app when Claude changes something there, so the change uploads. It doesn't touch them otherwise.
+- **Sync apps:** if Files is synced by MEGA or Notes is Obsidian, the bridge starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. Chrome is started whenever a Chrome tool needs it. It leaves them alone otherwise.
 - **Restoring a file:** copies are in `history\<Files|Notes>\...\<file>.<date-time>`, or use your sync app's version history.
 - **Keeping it reachable:**
   - **Sleep:** set sleep to Never when plugged in, and closing the lid to "Do nothing".

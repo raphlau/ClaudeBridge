@@ -1,7 +1,7 @@
 """Self-test for Claude Bridge. Run with the bridge's own Python:
     .venv\\Scripts\\python.exe selftest.py            (local, http://127.0.0.1:<port>)
     .venv\\Scripts\\python.exe selftest.py --public   (also through Tailscale Funnel)
-Read-only: it lists folders, searches, checks which apps (MEGA, Obsidian, Chrome, Claude) are running, reports whether
+Read-only: it lists folders, searches, reports whether
 the Chrome tools are connected, and confirms that requests without the token are refused. It changes nothing.
 """
 
@@ -43,7 +43,7 @@ async def check(base: str) -> bool:
                 await s.initialize()
                 tools = [t.name for t in (await s.list_tools()).tools]
                 print(f"tools ({len(tools)}): {', '.join(tools)}")
-                for name, args in [("list_dir", {}), ("app_status", {})]:
+                for name, args in [("list_dir", {})]:
                     res = await s.call_tool(name, args)
                     ok &= not res.is_error
                     print(f"\n{name}{' [ERROR]' if res.is_error else ''}:\n{text_of(res)}")

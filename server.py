@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -185,6 +185,8 @@ def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) ->
     is_dir = real.is_dir()
     if (rel and _denied(rel, is_dir)) or (real_rel and _denied(real_rel, is_dir)):
         raise BridgeError("That path is excluded by the bridge's deny list")
+    if not want_write:
+        sync_for_read(root)  # writes do this (and report it) themselves
     if want_write and not root.writable:
         raise BridgeError(f"'{root.name}' is read-only. Writable folders: " + (", ".join(r.name for r in ROOTS.values() if r.writable) or "none"))
     if must_exist and not real.exists():
@@ -444,13 +446,6 @@ def app_state(app: App) -> tuple[bool, str]:
     return True, "running"
 
 
-def get_app(name: str) -> App:
-    app = APPS.get((name or "").strip().lower())
-    if not app:
-        raise BridgeError(f"Unknown app {name!r}. Configured: " + (", ".join(a.name for a in APPS.values()) or "none"))
-    return app
-
-
 def ensure_app(name: str, start: bool = True) -> str:
     """Make sure an app is running (and for Obsidian, the vault is open); start it if not."""
     app = APPS.get((name or "").lower())
@@ -472,42 +467,24 @@ def ensure_app(name: str, start: bool = True) -> str:
 
 
 def ensure_for(root: Root) -> str:
+    """Before/after a change: make sure the folder's sync app runs, and say so."""
     msg = ensure_app(root.sync_app)
+    _sync_checked[root.sync_app.lower()] = time.time()
     return f"\n{msg}" if msg else ""
 
 
-def _quit(app: App) -> int:
-    """Close gracefully (like clicking X) so Chrome keeps its tabs, then force anything left."""
-    import psutil
-
-    procs = _procs(app)
-    if not procs:
-        return 0
-    pids = [str(p.pid) for p in procs]
-    args = ["taskkill"] + [x for pid in pids for x in ("/PID", pid)]
-    subprocess.run(args, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    _, alive = psutil.wait_procs(procs, timeout=10)
-    for p in alive:
-        try:
-            p.terminate()
-        except psutil.Error:
-            pass
-    _, alive = psutil.wait_procs(alive, timeout=5)
-    for p in alive:
-        try:
-            p.kill()
-        except psutil.Error:
-            pass
-    return len(procs)
+_sync_checked: dict[str, float] = {}
 
 
-def _logged_in_users() -> list[str]:
-    try:
-        import psutil
-
-        return sorted({u.name for u in psutil.users()})
-    except Exception:
-        return []
+def sync_for_read(root: Root) -> str:
+    """When a folder is read: start its sync app if it isn't running, so it pulls in recent changes. Checked at most
+    once a minute per app; says something only when it had to start the app."""
+    key = (root.sync_app or "").lower()
+    if not key or time.time() - _sync_checked.get(key, 0) < 60:
+        return ""
+    _sync_checked[key] = time.time()
+    msg = ensure_app(root.sync_app)
+    return f"\n({msg}, so recent changes from other devices may still be arriving.)" if "started it" in msg else ""
 
 
 # ---------------------------------------------------------------- Claude in Chrome (through Claude Code)
@@ -529,13 +506,15 @@ CHROME = {
     **(CFG.get("chrome") or {}),
 }
 CHROME_PERMISSION_MODES = ("ask", "skip_all_permission_checks", "follow_a_plan")
-# file_upload would hand any file on this PC to a web page, outside the shared folders and deny lists.
-CHROME_BLOCKED = {"file_upload"}
+# Claude in Chrome tools the bridge doesn't offer (also refused inside browser_batch). file_upload would hand any
+# file on this PC to a web page, and upload_image pushes images into pages. The browser pickers aren't needed: the
+# bridge picks the browser itself, and chrome_status(browser=...) covers the rare case it can't.
+CHROME_BLOCKED = {"file_upload", "upload_image", "gif_creator", "resize_window",
+                  "list_connected_browsers", "select_browser", "switch_browser"}
 CHROME_READ_ONLY = {"read_page", "find", "get_page_text", "read_console_messages", "read_network_requests",
-                    "list_connected_browsers"}
+                    "tabs_context_mcp"}
 CHROME_CACHE = BASE_DIR / "chrome_tools.json"  # last tool list, so tools/list is instant while the child starts
 CHROME_STATE = BASE_DIR / "chrome_state.json"  # the browser last used, so a choice made in chat sticks
-CHROME_PICKERS = {"select_browser", "switch_browser"}
 
 
 def _desktop_app_clis() -> list[Path]:
@@ -626,6 +605,8 @@ class ChromeLink:
         self._browser_checked = 0.0
         self._last_used = 0.0
         self._inflight = 0
+        self._chrome_checked = 0.0
+        self.browsers_seen: list[dict[str, Any]] = []
         self._saved: dict[str, Any] = {}
         if CHROME.get("enabled", True):
             self._load_cache()
@@ -753,6 +734,7 @@ class ChromeLink:
         on another computer is never picked automatically: then Claude asks, and the answer is remembered."""
         self._browser_checked = time.time()
         browsers = await self._browsers(session)
+        self.browsers_seen = browsers
         if not browsers:
             self._browser_ok, self.browser = False, "none connected (is Chrome running with the extension?)"
             return
@@ -768,7 +750,7 @@ class ChromeLink:
             if not pick:
                 self._browser_ok = False
                 self.browser = (f"not chosen: {len(browsers)} connected, none known to be this PC's. "
-                                "Ask Raph which one, then call select_browser; the bridge remembers it.")
+                                "Ask Raph which one, then call chrome_status(browser=...); the bridge remembers it.")
                 return
             res = await asyncio.wait_for(session.call_tool("select_browser", {"deviceId": pick["deviceId"]}), 30)
             if getattr(res, "is_error", False):
@@ -791,6 +773,42 @@ class ChromeLink:
         except Exception as e:  # noqa: BLE001 - never let this take the link down
             self._browser_ok, self.browser = False, f"couldn't check ({_err(e)})"
             log.warning("chrome: browser check failed: %s", _err(e))
+
+    async def pick(self, selector: str) -> None:
+        """Use the browser Raph chose (its deviceId, the start of it, or its name), and remember it."""
+        await asyncio.to_thread(self.use)
+        await self.wait_ready(45)
+        session, loop = self._session, self._loop
+        if session is None or loop is None:
+            raise BridgeError(f"Claude in Chrome isn't reachable right now ({self.error or self.state}).")
+
+        async def run() -> None:
+            browsers = await self._browsers(session)
+            sel = selector.lower()
+            match = [b for b in browsers if b["deviceId"].lower() == sel or str(b.get("name", "")).lower() == sel] or \
+                    [b for b in browsers if b["deviceId"].lower().startswith(sel)]
+            if len(match) != 1:
+                raise BridgeError(f"No single connected browser matches {selector!r}. Connected: "
+                                  + (", ".join(f"{b.get('name')} ({b['deviceId']})" for b in browsers) or "none"))
+            res = await asyncio.wait_for(session.call_tool("select_browser", {"deviceId": match[0]["deviceId"]}), 30)
+            if getattr(res, "is_error", False):
+                raise BridgeError(f"Couldn't select {match[0].get('name')}: {_text(res)[:200]}")
+            log.info("chrome: Raph picked browser %s (%s)", match[0].get("name"), match[0]["deviceId"])
+            await self._settle(session)  # now in use: remembered for next time
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(run(), loop))
+
+    def _start_chrome(self) -> bool:
+        """Start Chrome on the PC if it isn't running (checked at most every 30 s). True if it had to."""
+        app = APPS.get("chrome")
+        if not (IS_WINDOWS and app and app.launch) or time.time() - self._chrome_checked < 30:
+            return False
+        self._chrome_checked = time.time()
+        if app_state(app)[0]:
+            return False
+        msg = ensure_app("chrome")
+        log.info("chrome: %s", msg)
+        return "started it" in msg
 
     def restart(self) -> None:
         if self._loop and self._kick:
@@ -832,13 +850,17 @@ class ChromeLink:
         return CHROME.get("enabled", True) and (name in self.tools or name in CHROME_BLOCKED)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
-        if name in CHROME_BLOCKED or (name == "browser_batch" and any(
-                isinstance(a, dict) and a.get("name") in CHROME_BLOCKED for a in (arguments.get("actions") or []))):
-            raise BridgeError("file_upload isn't available through the bridge: it could send any file on the PC to a "
-                              "web page. Ask Raph to pick the file in the browser himself.")
+        blocked = name if name in CHROME_BLOCKED else next(
+            (a.get("name") for a in (arguments.get("actions") or []) if isinstance(a, dict) and a.get("name") in CHROME_BLOCKED),
+            None) if name == "browser_batch" else None
+        if blocked:
+            raise BridgeError(f"{blocked} isn't available through the bridge." + (
+                " It could send any file on the PC to a web page; ask Raph to pick the file in the browser himself."
+                if blocked == "file_upload" else ""))
         audit(f"chrome.{name}", **_chrome_audit_args(arguments))
         timeout = float(CHROME.get("call_timeout_seconds", 180))
         await asyncio.to_thread(self.use)  # starts Claude Code's Chrome server if it's idle
+        chrome_started = await asyncio.to_thread(self._start_chrome)
         for attempt in (1, 2):
             if not self._ready.is_set():
                 await self.wait_ready(45 if attempt == 1 else 20)
@@ -846,19 +868,29 @@ class ChromeLink:
             if session is None or loop is None:
                 raise BridgeError(f"Claude in Chrome isn't reachable through the bridge right now ({self.error or self.state}). "
                                   "Call chrome_status for details.")
-            # Re-check the browser choice now and then (Chrome restarted, extension reinstalled...).
-            age = time.time() - self._browser_checked
-            if name not in CHROME_PICKERS and ((not self._browser_ok and age > 30) or age > 900):
-                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
+            if chrome_started:
+                # Chrome was just started: give the extension up to 20 s to come online, then pick the browser.
+                chrome_started = False
+                for _ in range(10):
+                    await asyncio.sleep(2)
+                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
+                    if self._browser_ok:
+                        break
+            else:
+                # Re-check the browser choice now and then (Chrome restarted, extension reinstalled...).
+                age = time.time() - self._browser_checked
+                if (not self._browser_ok and age > 30) or age > 900:
+                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
+            if not self._browser_ok and len(self.browsers_seen) > 1:
+                raise BridgeError(
+                    "Several Chrome browsers are signed in to this account and the bridge can't tell which one is on the "
+                    "PC:\n" + "\n".join(f"- {b.get('name') or '?'} (deviceId {b['deviceId']})" for b in self.browsers_seen)
+                    + "\nAsk Raph which one is the PC's, then call chrome_status(browser='<deviceId>'). It's remembered.")
             sent = time.time()
             fut = asyncio.run_coroutine_threadsafe(session.call_tool(name, arguments, read_timeout_seconds=timeout), loop)
             self._inflight += 1
             try:
-                result = await asyncio.wrap_future(fut)
-                if name in CHROME_PICKERS and not getattr(result, "is_error", False):
-                    # Remember the browser Raph picked, so the next chat doesn't have to ask.
-                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._settle_quietly(session), loop))
-                return result
+                return await asyncio.wrap_future(fut)
             except Exception as e:  # noqa: BLE001 - a transport failure or timeout, not a tool error
                 log.warning("chrome: %s failed: %s", name, _err(e))
                 # The child died between pings: restart it. Retry only if the call failed at once,
@@ -894,6 +926,9 @@ class ChromeLink:
         ]
         if self.state == "connected":
             lines.insert(1, f"Browser: {self.browser or 'not checked yet'}")
+            if len(self.browsers_seen) > 1 or not self._browser_ok:
+                lines[2:2] = [f"  connected: {b.get('name') or '?'} (deviceId {b['deviceId']})"
+                              f"{' <- in use' if b.get('inUse') else ''}" for b in self.browsers_seen]
         elif self._saved.get("device_id"):
             lines.insert(1, f"Browser: {self._saved.get('name') or '?'} ({str(self._saved['device_id'])[:8]}..., used last)")
         want = str(CHROME.get("claude_path") or "").strip()
@@ -933,13 +968,12 @@ Paths always start with the folder name, e.g. 'Notes/Insurance.md'. Changes sync
 so change only what was asked. Prefer edit_text/append_text over rewriting whole notes. Nothing can be deleted or moved,
 and the bridge keeps the previous version of anything it changes. It won't write programs, scripts or shortcuts.
 For big or binary files (docx, xlsx, zip...), use create_download_link and fetch the URL from your own workspace.
-app_status / start_app / quit_app manage the apps the bridge knows (Chrome, the Claude desktop app, sync apps).
+The bridge starts the apps that sync these folders, and Chrome, by itself when they're needed.
 Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer, read_page, find, get_page_text...) are
-Claude in Chrome, run through Claude Code on the PC, so they work from any chat, linked or not, without the Claude app.
-Start with tabs_context_mcp(createIfEmpty=true) and work in your own tab. If a call says Chrome or the extension isn't
-connected, call start_app('Chrome'), wait a few seconds and retry; chrome_status shows what's wrong. The bridge picks
-this PC's browser by itself; if list_connected_browsers says none is selected, ask Raph which one, then call
-select_browser (the bridge remembers it). file_upload is not available.
+Claude in Chrome, run through Claude Code on the PC, so they work from any chat. Start with
+tabs_context_mcp(createIfEmpty=true) and work in your own tab. The bridge starts Chrome and picks the PC's browser by
+itself; if it says it can't tell which browser is the PC's, ask Raph, then call chrome_status(browser=...).
+chrome_status also shows what's wrong when Chrome calls fail. Uploading files to websites isn't available.
 update_bridge checks for a newer version of the bridge and can install it; it also updates itself once a day."""
 
 
@@ -969,6 +1003,7 @@ def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) ->
     if not path.strip().strip("/"):
         lines = ["Shared folders:"]
         for r in ROOTS.values():
+            sync_for_read(r)
             state = "ok" if r.path.exists() else "MISSING on disk"
             lines.append(f"- {r.name}  ({'writable' if r.writable else 'read-only'}, {state})")
         return "\n".join(lines)
@@ -1014,6 +1049,8 @@ def find_files(pattern: str, path: str = "", max_results: int = 200) -> str:
     pat = pattern.lower()
     is_glob = any(c in pat for c in "*?[")
     targets = [resolve(path)[:2]] if path.strip("/ ") else [(r, r.path) for r in ROOTS.values() if r.path.exists()]
+    for r, _ in targets:
+        sync_for_read(r)
     out, scanned = [], 0
     for root, start in targets:
         for full, rel in walk(root, start):
@@ -1040,6 +1077,8 @@ def search_text(query: str, path: str = "", regex: bool = False, file_glob: str 
     except re.error as e:
         raise BridgeError(f"Bad regex: {e}")
     targets = [resolve(path)[:2]] if path.strip("/ ") else [(r, r.path) for r in ROOTS.values() if r.path.exists()]
+    for r, _ in targets:
+        sync_for_read(r)
     out, scanned, hits = [], 0, 0
     ctx = max(0, min(context_lines, 5))
     for root, start in targets:
@@ -1235,84 +1274,22 @@ def make_folder(path: str) -> str:
     return f"Folder ready: {disp}" + ensure_for(root)
 
 
-@mcp.tool(annotations=RO)
-def app_status() -> str:
-    """Which desktop apps the bridge knows are running on the PC: the apps that sync the shared folders, Chrome,
-    and the Claude desktop app."""
-    audit("app_status")
-    if not APPS:
-        return "No apps configured"
-    lines = []
-    for app in APPS.values():
-        state = app_state(app)[1] if IS_WINDOWS else "can't check on this OS"
-        extra = " (can quit)" if app.can_quit else ""
-        lines.append(f"{app.name}: {state}{extra}")
-    synced = [f"{r.name} -> {r.sync_app}" for r in ROOTS.values() if r.sync_app]
-    if synced:
-        lines.append("Synced folders: " + ", ".join(synced))
-    users = _logged_in_users()
-    lines.append(f"Signed-in Windows users: {', '.join(users) if users else 'none detected'}")
-    return "\n".join(lines)
-
-
-@mcp.tool(annotations=WR)
-async def start_app(name: str) -> str:
-    """Start a desktop app on the PC if it isn't running: one named by app_status, e.g. 'Chrome' or 'Claude'
-    (a notes app also gets its vault opened). Needs someone signed in to Windows
-    (a locked screen is fine)."""
-    audit("start_app", name=name)
-    app = get_app(name)
-    if not IS_WINDOWS:
-        return "App control only works on Windows"
-    ready, state = app_state(app)
-    if ready:
-        return f"{app.name} is already {state}."
-    if not app.launch:
-        raise BridgeError(f"No launch command for {app.name} in config.json (re-run install.cmd after installing it)")
-    err = _launch(app.launch)
-    if err:
-        raise BridgeError(f"Couldn't start {app.name}: {err}")
-    for _ in range(30):
-        await asyncio.sleep(1)
-        ready, state = app_state(app)
-        if ready:
-            hint = " Give it ~20 seconds to connect before linking a session." if app.name.lower() == "claude" else ""
-            return f"{app.name} is {state}.{hint}"
-    users = _logged_in_users()
-    return (f"Asked {app.name} to start, but it isn't ready after 30 seconds ({state}). "
-            + ("Nobody seems to be signed in to Windows; apps can only start in a signed-in session."
-               if not users else "Check app_status again shortly."))
-
-
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False))
-async def quit_app(name: str) -> str:
-    """Close a desktop app on the PC: 'Claude' (ends any remote link to the computer) or 'Chrome'
-    (closed like clicking X, so tabs come back next time). Apps that sync the shared folders can't be closed from here."""
-    audit("quit_app", name=name)
-    app = get_app(name)
-    if not app.can_quit:
-        raise BridgeError(f"{app.name} keeps your files syncing, so the bridge won't close it")
-    if not IS_WINDOWS:
-        return "App control only works on Windows"
-    if not _procs(app):
-        return f"{app.name} isn't running."
-    n = await asyncio.to_thread(_quit, app)
-    await asyncio.sleep(1)
-    return f"{app.name} closed." if not _procs(app) else f"Some {app.name} processes are still running; check app_status."
-
-
-@mcp.tool(annotations=RO)
-async def chrome_status(restart: bool = False) -> str:
-    """Is Claude in Chrome on the PC reachable through the bridge? Shows the link state, Claude Code's path, the
-    browser in use and the last error. 'idle' is normal: the link starts by itself on the next Chrome call.
-    restart=True (re)starts the bridge's connection to Claude Code's Chrome server and waits for it (try it if
-    Chrome calls keep failing while Chrome is running)."""
-    audit("chrome_status", restart=restart)
-    if restart and CHROME_LINK.state not in ("off",):
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))
+async def chrome_status(browser: str = "", restart: bool = False) -> str:
+    """Claude in Chrome on the PC: the link state, the browser in use and any error. 'idle' is normal: the link
+    starts by itself on the next Chrome call. browser='<deviceId or name>' picks which signed-in Chrome to use
+    (only needed when the bridge says it can't tell which one is this PC's; ask Raph first). restart=True restarts
+    the link (try it if Chrome calls keep failing while Chrome is running)."""
+    audit("chrome_status", browser=browser, restart=restart)
+    if CHROME_LINK.state == "off":
+        return CHROME_LINK.describe()
+    if restart:
         await asyncio.to_thread(CHROME_LINK.use)
         CHROME_LINK.restart()
         await asyncio.sleep(2)
         await CHROME_LINK.wait_ready(45)
+    if browser.strip():
+        await CHROME_LINK.pick(browser.strip())
     return CHROME_LINK.describe()
 
 
