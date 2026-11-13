@@ -24,7 +24,7 @@ It doesn't need the Claude desktop app running, and it doesn't use the app's com
 - **No clicks outside Chrome:** the Chrome tools click and type only inside Chrome, through the Claude in Chrome extension and its own site permissions. Nothing else on the screen is touched, and linking a cloud session to the PC is still your decision.
 - **No file uploads from the PC to websites:** Claude in Chrome's `file_upload` is blocked (also inside `browser_batch`), since it could send any file on the PC to a web page.
 - **Everything is logged:** every tool call goes to `logs\bridge.log`. For Chrome, the log keeps URLs and actions but not the text Claude typed.
-- **Updates only from the releases repo:** the updater downloads from `raphlau/ClaudeBridge-releases` only, checks the SHA-256, and won't turn the bridge back on if you switched it off.
+- **Updates only from this repo's releases:** the updater downloads only from `raphlau/ClaudeBridge` releases, checks the SHA-256, and won't turn the bridge back on if you switched it off.
 
 ## Install (about 10 minutes)
 
@@ -33,10 +33,10 @@ It doesn't need the Claude desktop app running, and it doesn't use the app's com
 1. Open **PowerShell from the Start menu**. Don't use a terminal inside the Claude app: it redirects AppData, and the installer refuses to run there. No admin needed. Then run:
 
    ```powershell
-   irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex
+   irm https://github.com/raphlau/ClaudeBridge/releases/latest/download/get.ps1 | iex
    ```
 
-   It downloads the latest release, checks its SHA-256 and starts the installer. (Or download `ClaudeBridge.zip` from the [releases page](https://github.com/raphlau/ClaudeBridge-releases/releases), unzip it and double-click `install.cmd`.)
+   It downloads the latest release, checks its SHA-256 and starts the installer. (Or download `ClaudeBridge.zip` from the [releases page](https://github.com/raphlau/ClaudeBridge/releases), unzip it and double-click `install.cmd`.)
 2. Paste in two paths: your **MEGA folder** (or a subfolder of it) and your **Obsidian vault's top folder**. In Explorer, Shift+right-click a folder and choose "Copy as path".
 3. When Tailscale asks you to approve **Funnel** for this PC (a browser page or a link), approve it.
 
@@ -93,7 +93,7 @@ It never picks a browser on another computer by itself. If none of these fits (f
 
 ## Updates
 
-Releases are published to the public repo [raphlau/ClaudeBridge-releases](https://github.com/raphlau/ClaudeBridge-releases/releases). The source repo stays private.
+New versions are published as [GitHub releases](https://github.com/raphlau/ClaudeBridge/releases) of this repo.
 
 - **Daily:** the `ClaudeBridge Update` task runs `update.ps1` around 04:00 to 06:00, or later if the PC was off.
 - **What an update does:** if there's a newer release, it downloads `ClaudeBridge.zip`, checks its SHA-256, and runs the new installer unattended. Your folders, token, connector and settings are kept.
@@ -103,14 +103,10 @@ Releases are published to the public repo [raphlau/ClaudeBridge-releases](https:
 - **Status:** `bridge.cmd status` and `update_bridge` show the version and the last update result. Details are in `logs\update.log`.
 - **Turn off the daily update:** set `"update": {"auto": false}` in `config.json`. `update_bridge(install=True)` still works.
 
-**Making a release** (in the source repo):
+**Making a release:**
 1. Bump `VERSION` in `server.py` and commit.
 2. Push a matching tag: `git tag v1.4.1`, then `git push origin main v1.4.1`.
-3. The `Release` workflow checks that the tag matches `VERSION`, checks that the `.ps1`/`.cmd` files are ASCII and that the Python compiles, then builds the zip and publishes it to both repos.
-
-**One-time setup** for the public releases:
-- **Releases repo:** a public `raphlau/ClaudeBridge-releases` repo with at least one commit (for example a README).
-- **Token:** an Actions secret named `RELEASES_TOKEN` in the source repo, holding a fine-grained token with **Contents: read and write** on the releases repo only.
+3. The `Release` workflow checks that the tag matches `VERSION`, checks that the `.ps1`/`.cmd` files are ASCII and that the Python compiles, then builds the zip and publishes the release. It uses GitHub's built-in workflow token, so there are no secrets to set up.
 
 ## Linking a session to the PC
 

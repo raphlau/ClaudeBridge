@@ -26,7 +26,7 @@ phone. It's published via **Tailscale Funnel** and protected by a bearer token. 
 - Installs and updates must not run from a Claude desktop app session: it redirects new AppData writes into the app's
   own storage, where the scheduled tasks can't see them. install.ps1 detects this and refuses. Raph runs the
   one-liner from PowerShell opened from the Start menu:
-  `irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex`
+  `irm https://github.com/raphlau/ClaudeBridge/releases/latest/download/get.ps1 | iex`
 - Updates run inside the `ClaudeBridge Update` scheduled task, which runs outside the app, so they're safe to start
   from anywhere: `bridge.cmd update`, or the `update_bridge` MCP tool (`install=True`, or `reinstall=True` to
   reinstall the same version). update.ps1 downloads the release, checks its SHA-256, runs
@@ -37,12 +37,11 @@ phone. It's published via **Tailscale Funnel** and protected by a bearer token. 
 
 ## Releasing
 
-The source repo (raphlau/ClaudeBridge) is private. Releases go to the public raphlau/ClaudeBridge-releases repo via
-`.github/workflows/release.yml`.
+The repo (raphlau/ClaudeBridge) is public; `.github/workflows/release.yml` publishes GitHub releases of it with the
+built-in workflow token. Never commit config.json, connector.txt, logs or anything else with the token or personal paths.
 1. Bump `VERSION` in server.py and commit.
 2. Tag `v<VERSION>` and push the tag.
-3. The workflow refuses a tag that doesn't match `VERSION`, and fails on non-ASCII .ps1/.cmd files. Publishing to the
-   public repo needs the `RELEASES_TOKEN` Actions secret.
+3. The workflow refuses a tag that doesn't match `VERSION`, and fails on non-ASCII .ps1/.cmd files.
 4. Add any new file the install needs to both the workflow's zip list and install.ps1's copy list.
 
 ## Rules

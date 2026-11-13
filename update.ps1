@@ -4,7 +4,7 @@
   Run by the 'ClaudeBridge Update' scheduled task once a day (-Scheduled) and when Claude calls update_bridge.
   To update now by hand: .\bridge.cmd update
 
-  It downloads the release from the public releases repo, checks its SHA-256, and runs that release's
+  It downloads the release from GitHub (raphlau/ClaudeBridge), checks its SHA-256, and runs that release's
   installer unattended (which keeps config.json, the token and your settings). If the new version doesn't
   start, it puts the previous files back. Everything goes to logs\update.log.
 #>
@@ -70,7 +70,7 @@ function Find-Uv {
 
 function Invoke-Update([string]$tmp) {
     $cfg = Get-Content -LiteralPath (Join-Path $Dir 'config.json') -Raw | ConvertFrom-Json
-    $repo = 'raphlau/ClaudeBridge-releases'
+    $repo = 'raphlau/ClaudeBridge'
     $auto = $true
     if ($cfg.update) {
         if ($cfg.update.repo) { $repo = [string]$cfg.update.repo }

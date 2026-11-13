@@ -5,7 +5,7 @@
 
 .USAGE
   Easiest, in PowerShell from the Start menu (no need for admin):
-    irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex
+    irm https://github.com/raphlau/ClaudeBridge/releases/latest/download/get.ps1 | iex
   Or from an unzipped release folder:
     powershell -ExecutionPolicy Bypass -File .\install.ps1
 

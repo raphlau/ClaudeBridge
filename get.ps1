@@ -1,16 +1,16 @@
 # Claude Bridge one-line installer. In PowerShell opened from the Start menu (not inside the Claude app):
 #
-#   irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1 | iex
+#   irm https://github.com/raphlau/ClaudeBridge/releases/latest/download/get.ps1 | iex
 #
 # Downloads the latest release, checks its SHA-256 and runs its installer (install.ps1). Safe to re-run: an
 # existing install keeps its folders, token and settings. To pass installer options such as -Reconfigure:
 #
-#   & ([scriptblock]::Create((irm https://github.com/raphlau/ClaudeBridge-releases/releases/latest/download/get.ps1))) -Reconfigure
+#   & ([scriptblock]::Create((irm https://github.com/raphlau/ClaudeBridge/releases/latest/download/get.ps1))) -Reconfigure
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $repo = 'raphlau/ClaudeBridge-releases'
+    $repo = 'raphlau/ClaudeBridge'
     $installerArgs = @($args)
     $tmp = Join-Path $env:TEMP ('ClaudeBridge-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $tmp | Out-Null

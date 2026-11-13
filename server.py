@@ -1232,11 +1232,11 @@ async def chrome_status(restart: bool = False) -> str:
 
 # ---------------------------------------------------------------- updates
 #
-# Releases are published to a public repo (the source repo is private). The 'ClaudeBridge Update' scheduled task
+# Releases are GitHub releases of raphlau/ClaudeBridge (public). The 'ClaudeBridge Update' scheduled task
 # runs update.ps1 once a day; update_bridge(install=True) asks it to run now. update.ps1 downloads the release,
 # checks its SHA-256, runs its installer unattended and puts the old files back if the new version doesn't start.
 
-UPDATE = {"auto": True, "repo": "raphlau/ClaudeBridge-releases", **(CFG.get("update") or {})}
+UPDATE = {"auto": True, "repo": "raphlau/ClaudeBridge", **(CFG.get("update") or {})}
 UPDATE_TASK = "ClaudeBridge Update"
 UPDATE_STATE = BASE_DIR / "update_state.json"      # written by update.ps1
 UPDATE_REQUEST = BASE_DIR / "update_request.json"  # read (and deleted) by update.ps1
