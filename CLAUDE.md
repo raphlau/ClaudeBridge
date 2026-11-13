@@ -53,6 +53,9 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
   (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
   self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
+- The server must not do anything by itself while unused: no timers or watchers. MEGA/Obsidian are only checked and
+  started by write tools (`ensure_for`), history is pruned from `keep_history`, and the Chrome child starts on the
+  first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
 - update.ps1 must stay a no-op while the bridge is switched off (`bridge.cmd off` is the kill switch), and must
   never print the token: install.ps1 -Unattended output goes into logs\update.log.
 - Never paste the token into anything other than this machine's files or the chat with Raph.

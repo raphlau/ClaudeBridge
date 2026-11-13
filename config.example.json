@@ -10,7 +10,6 @@
     { "name": "MEGA", "process": "MEGAsync.exe", "launch": ["C:\\Users\\you\\AppData\\Local\\MEGAsync\\MEGAsync.exe"] },
     { "name": "Obsidian", "process": "Obsidian.exe", "launch": "obsidian://open?vault=Vault", "vault": "C:\\Users\\you\\Documents\\Obsidian\\Vault" }
   ],
-  "sync_watchdog_minutes": 0,
   "history_days": 30,
   "deny_folders": [".git", ".obsidian", ".ssh", ".gnupg", ".debris", "$recycle.bin"],
   "deny_files": ["*.kdbx", "*.kdb", ".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*"],

@@ -201,7 +201,7 @@ $cfgOut = [ordered]@{
     apps        = $apps
     quiet       = $true
 }
-# keep any other settings you added by hand (deny lists, history_days, sync_watchdog_minutes, limits...)
+# keep any other settings you added by hand (deny lists, history_days, limits, chrome, update...)
 if ($cfg) {
     foreach ($prop in $cfg.PSObject.Properties) {
         if ($prop.Name -notin @('listen_port', 'public_url', 'token', 'roots', 'apps', 'sync_apps', 'claude_app', 'quiet')) { $cfgOut[$prop.Name] = $prop.Value }

@@ -7,7 +7,7 @@ published to the internet through **Tailscale Funnel**. It gives Claude, from an
 - Precise note edits: replace a passage, append to a note, or create a note.
 - PDF text, PDF pages and images as pictures, and full-text search across notes.
 - Short-lived download and upload links, so Claude can move big or binary files between your PC and its cloud workspace.
-- **Sync kept running:** before every change it makes, the bridge checks that the **MEGA app** and **Obsidian** (with your vault open) are running, and starts them if not, so changes get uploaded. It also checks once at sign-in.
+- **Sync kept running, only when needed:** when Claude changes a file, the bridge checks that the **MEGA app** or **Obsidian** (with your vault open) is running for that folder, and starts it if not, so the change gets uploaded. Reading files doesn't touch them, and the bridge does nothing by itself while nobody uses it.
 - **App control:** Claude can check, start and close **MEGA, Obsidian, Chrome and the Claude desktop app** (`app_status`, `start_app`, `quit_app`). It can't close MEGA or Obsidian, since they do the syncing. This lets you turn on computer access only while you need it.
 - **Claude in Chrome from any chat:** the bridge passes through Claude in Chrome's browser tools (`navigate`, `computer`, `read_page`, `find`, `get_page_text`, `tabs_context_mcp`...), using Claude Code on this PC. Any chat with the connector can use Chrome here, including one started on your phone that isn't linked to the computer. See [Claude in Chrome](#claude-in-chrome-from-any-chat).
 - **Updates itself:** once a day it installs the latest release, and Claude can update it on request (`update_bridge`). See [Updates](#updates).
@@ -75,7 +75,7 @@ The bridge runs the Claude in Chrome server that ships with **Claude Code** (`cl
 2. **Sign in once:** in PowerShell from the Start menu, run that `claude.exe` (for the app's copy: `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<version>\<build>\claude.exe`), then `/login` with the **same claude.ai account** as the Chrome extension. The desktop app signs in its own sessions itself, but the bridge runs Claude Code on its own, so it needs this sign-in. It's kept in `%USERPROFILE%\.claude` and survives app updates.
 3. `bridge.cmd restart`, then the self-test. `chrome_status` should say *connected* and name the browser.
 
-**Using it:** just ask, for example "Open my Amazon orders in Chrome on my laptop". Claude starts Chrome with `start_app` if it isn't running.
+**Using it:** just ask, for example "Open my Amazon orders in Chrome on my laptop". Claude starts Chrome with `start_app` if it isn't running. Claude Code's Chrome server only runs while Chrome is in use. It starts on the first Chrome call (a few seconds) and stops after 10 minutes without one. `chrome_status` saying *idle* is normal.
 
 **Which browser:** if several browsers are signed in to your account, the bridge picks one without asking anyone:
 - the browser already in use;
@@ -87,7 +87,7 @@ It never picks a browser on another computer by itself. If none of these fits (f
 
 **Site permissions:** by default the Claude in Chrome extension's own site settings apply. If a site isn't allowed there, the extension asks in Chrome on the PC, which you can't answer from your phone. Either allow the sites you use in the extension's settings, or set `"chrome": {"permission_mode": "skip_all_permission_checks"}` in `config.json` so it never asks (this lets Claude act on any site). `ask` and `follow_a_plan` are the other values Claude Code accepts.
 
-**Other settings** (all under `"chrome"` in `config.json`): `"enabled": false` turns the Chrome tools off; `"device_id"` is the starting choice of browser (a deviceId from `list_connected_browsers`); `"call_timeout_seconds"` (default 180).
+**Other settings** (all under `"chrome"` in `config.json`): `"enabled": false` turns the Chrome tools off; `"device_id"` is the starting choice of browser (a deviceId from `list_connected_browsers`); `"call_timeout_seconds"` (default 180); `"idle_minutes"` (default 10) is how long the Chrome link stays up after the last Chrome call.
 
 **If it doesn't work:** ask Claude to run `chrome_status` (it can also restart the connection with `restart=true`), or check `logs\chrome-mcp.log`. Claude Code and the extension must be signed in to the same account, and Chrome must be running with the extension.
 
@@ -127,7 +127,7 @@ The Claude desktop app only gives remote access while it's **open**. So leave it
   2. In Device Manager > network adapter > Power Management, allow it to wake the PC with a magic packet.
   3. Turn off Fast Startup.
   4. Send the packet from your router's app or another always-on device. Tailscale can't wake a sleeping PC by itself.
-- **Keeping MEGA and Obsidian up:** by default the bridge only checks them at sign-in and before its own changes. To have it re-check every N minutes, set `"sync_watchdog_minutes": N` in `config.json`. Note that it would then reopen them if you close them yourself.
+- **MEGA and Obsidian:** the bridge only starts them when Claude changes a file in their folder, so changes Claude makes always upload. Otherwise they run (or not) as you choose; to have them always on, use their own "start at sign-in" settings.
 
 ## Turning it off
 

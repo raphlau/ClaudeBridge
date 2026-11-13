@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -235,8 +235,19 @@ HISTORY_DAYS = int(CFG.get("history_days", 30))
 HISTORY_MAX_BYTES = 100 * 1024 * 1024
 
 
+_last_prune = 0.0
+
+
 def keep_history(root: Root, real: Path) -> str:
-    """Copy a file into the bridge's local history (outside the synced folders) before it changes."""
+    """Copy a file into the bridge's local history (outside the synced folders) before it changes.
+    Old copies are cleared out here too (at most once a day), so nothing runs while the bridge isn't used."""
+    global _last_prune
+    if time.time() - _last_prune > 86400:
+        _last_prune = time.time()
+        try:
+            prune_history()
+        except Exception:  # noqa: BLE001 - never block a write over housekeeping
+            log.exception("history clean-up failed")
     if not real.is_file():
         return ""
     if real.stat().st_size > HISTORY_MAX_BYTES:
@@ -457,34 +468,14 @@ def _logged_in_users() -> list[str]:
         return []
 
 
-def _background_loop() -> None:
-    time.sleep(int(CFG.get("startup_delay_seconds", 60)))  # let normal sign-in autostart happen first
-    every = int(CFG.get("sync_watchdog_minutes", 0))
-    sync_names = {r.sync_app.lower() for r in ROOTS.values() if r.sync_app}
-    first, last_prune = True, 0.0
-    while True:
-        try:
-            if every or first:
-                for name in sync_names:
-                    m = ensure_app(name)
-                    if "started" in m or "NOT" in m or "failed" in m:
-                        log.info("check: %s", m)
-                first = False
-            if time.time() - last_prune > 86400:
-                prune_history()
-                last_prune = time.time()
-        except Exception:
-            log.exception("background loop error")
-        time.sleep(max(1, every) * 60)
-
-
 # ---------------------------------------------------------------- Claude in Chrome (through Claude Code)
 #
 # Claude Code ships the Claude in Chrome MCP server that it normally starts for itself
 # (`claude --claude-in-chrome-mcp`, stdio). The bridge runs it as a child process, signed in with
 # Claude Code's own login, and passes its browser tools through. So any chat with this connector can
 # use Chrome on this PC, including one started on a phone that isn't linked to the computer.
-# The child lives in its own thread and event loop, so it isn't tied to any one HTTP request.
+# The child lives in its own thread and event loop, so it isn't tied to any one HTTP request. It only runs while
+# Chrome is in use: it starts on the first Chrome call and stops after chrome.idle_minutes without one.
 
 CHROME = {
     "enabled": True,
@@ -492,6 +483,7 @@ CHROME = {
     "permission_mode": "",      # "" = the extension's own site permissions; or ask / skip_all_permission_checks / follow_a_plan
     "device_id": "",            # starting choice of browser (deviceId); a browser picked later is remembered in chrome_state.json
     "call_timeout_seconds": 180,
+    "idle_minutes": 10,         # stop Claude Code's Chrome server after this long without a Chrome call
     **(CFG.get("chrome") or {}),
 }
 CHROME_PERMISSION_MODES = ("ask", "skip_all_permission_checks", "follow_a_plan")
@@ -575,7 +567,7 @@ def _chrome_audit_args(args: dict[str, Any]) -> dict[str, Any]:
 class ChromeLink:
     def __init__(self) -> None:
         self.tools: dict[str, Tool] = {}
-        self.state = "off" if not CHROME.get("enabled", True) else "not started"
+        self.state = "off" if not CHROME.get("enabled", True) else "idle"
         self.error = ""
         self.cli = ""
         self.since = 0.0
@@ -583,12 +575,14 @@ class ChromeLink:
         self._session: ClientSession | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._kick: asyncio.Event | None = None
+        self._wake: asyncio.Event | None = None
+        self._loop_ready = threading.Event()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self.browser = ""              # which browser calls go to, for chrome_status
         self._browser_ok = False
         self._browser_checked = 0.0
-        self._cli_checked = 0.0
+        self._last_used = 0.0
         self._inflight = 0
         self._saved: dict[str, Any] = {}
         if CHROME.get("enabled", True):
@@ -607,15 +601,40 @@ class ChromeLink:
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), name="bridge-chrome", daemon=True)
         self._thread.start()
 
+    def _wanted(self) -> bool:
+        idle = max(1.0, float(CHROME.get("idle_minutes", 10))) * 60
+        return time.time() - self._last_used < idle
+
+    def use(self) -> None:
+        """Note that Chrome is being used, and start Claude Code's Chrome server if it isn't running."""
+        self._last_used = time.time()
+        self.start()
+        self._loop_ready.wait(5)
+        if self._loop and self._wake:
+            self._loop.call_soon_threadsafe(self._wake.set)
+
+    async def wait_ready(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while not self._ready.is_set() and time.time() < end and self.state != "Claude Code not found":
+            await asyncio.to_thread(self._ready.wait, 0.5)
+
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._kick = asyncio.Event()
+        self._wake = asyncio.Event()
+        self._loop_ready.set()
         delay = 5
         while True:
+            if not self._wanted():
+                # Nothing running and nothing to do until the next Chrome call.
+                self.state = "idle"
+                self._wake.clear()
+                await self._wake.wait()
+                delay = 5
             began = time.time()
             try:
                 await self._connect_once()
-                delay = 1  # a requested restart
+                delay = 1  # a requested restart, or stopped for being idle
             except Exception as e:  # noqa: BLE001 - the child failed to start, or died
                 self.error = _err(e)
                 log.warning("chrome: link down: %s", self.error)
@@ -623,6 +642,8 @@ class ChromeLink:
             self._ready.clear()
             if self.state == "connected":
                 self.state = "reconnecting"
+            if not self._wanted():
+                continue  # nobody is using Chrome: go idle rather than retry
             if time.time() - began > 300:
                 delay = 5
             await asyncio.sleep(delay)
@@ -656,11 +677,10 @@ class ChromeLink:
                     self.tools = {t.name: t for t in listed if t.name not in CHROME_BLOCKED}
                     self._save_cache()
                     self._session, self.error, self.state, self.since = session, "", "connected", time.time()
-                    self._ready.set()
                     log.info("chrome: Claude Code's Chrome server is up (%s), %d tools", self.cli, len(self.tools))
-                    self._cli_checked = time.time()
-                    await self._settle_quietly(session)
-                    while True:  # stay up; ping so a dead child is noticed
+                    await self._settle_quietly(session)  # before the first call goes through
+                    self._ready.set()
+                    while True:  # stay up while in use; ping so a dead child is noticed
                         try:
                             await asyncio.wait_for(self._kick.wait(), 10)
                             self._kick.clear()
@@ -668,14 +688,12 @@ class ChromeLink:
                             return
                         except TimeoutError:
                             pass
+                        if self._inflight == 0 and not self._wanted():
+                            # Leaving also means the next start picks up a newer Claude Code if the app updated.
+                            log.info("chrome: not used for %s min, stopping Claude Code's Chrome server",
+                                     CHROME.get("idle_minutes", 10))
+                            return
                         await asyncio.wait_for(session.send_ping(), 20)
-                        if time.time() - self._cli_checked > 1800:
-                            # The desktop app swaps its bundled CLI on update: move to the new one when idle.
-                            self._cli_checked = time.time()
-                            newer = await asyncio.to_thread(find_claude_code)
-                            if newer and os.path.normcase(newer) != os.path.normcase(self.cli) and self._inflight == 0:
-                                log.info("chrome: switching to %s", newer)
-                                return
 
     # -- choosing the browser (runs in the bridge-chrome thread)
 
@@ -757,8 +775,10 @@ class ChromeLink:
     async def tool_list(self) -> list[Tool]:
         if not CHROME.get("enabled", True):
             return []
-        if self.state == "starting" or (self.state == "not started" and self._thread):
-            await asyncio.to_thread(self._ready.wait, 8)  # the bridge just started
+        if not self.tools:
+            # Very first use on this PC: nothing cached yet, so start Claude Code's Chrome server to learn its tools.
+            await asyncio.to_thread(self.use)
+            await self.wait_ready(15)
         out = []
         for t in self.tools.values():
             ann = ToolAnnotations(title=t.title or None, read_only_hint=t.name in CHROME_READ_ONLY,
@@ -776,9 +796,10 @@ class ChromeLink:
                               "web page. Ask Raph to pick the file in the browser himself.")
         audit(f"chrome.{name}", **_chrome_audit_args(arguments))
         timeout = float(CHROME.get("call_timeout_seconds", 180))
+        await asyncio.to_thread(self.use)  # starts Claude Code's Chrome server if it's idle
         for attempt in (1, 2):
-            if not self._ready.is_set() and self._thread and (attempt == 2 or self.state in ("not started", "starting", "reconnecting")):
-                await asyncio.to_thread(self._ready.wait, 20)
+            if not self._ready.is_set():
+                await self.wait_ready(45 if attempt == 1 else 20)
             session, loop = self._session, self._loop
             if session is None or loop is None:
                 raise BridgeError(f"Claude in Chrome isn't reachable through the bridge right now ({self.error or self.state}). "
@@ -809,13 +830,18 @@ class ChromeLink:
                 raise BridgeError(f"The Chrome call didn't complete ({_err(e)}). Call chrome_status, then retry.") from None
             finally:
                 self._inflight -= 1
+                self._last_used = time.time()  # the idle time counts from the end of the last call
         raise BridgeError("The Chrome call didn't complete. Call chrome_status, then retry.")
 
     def describe(self) -> str:
         if not CHROME.get("enabled", True):
             return "Chrome tools: turned off in config.json (\"chrome\": {\"enabled\": false})"
+        idle_min = CHROME.get("idle_minutes", 10)
         if self.state == "connected":
-            head = f"Chrome tools: connected since {fmt_time(self.since)} ({len(self.tools)} tools)"
+            head = f"Chrome tools: connected since {fmt_time(self.since)} ({len(self.tools)} tools; stops after {idle_min} min unused)"
+        elif self.state == "idle":
+            head = (f"Chrome tools: idle. Claude Code's Chrome server starts on the next Chrome call and stops after "
+                    f"{idle_min} min unused" + (f" (last error: {self.error})" if self.error else ""))
         else:
             head = f"Chrome tools: NOT connected ({self.state}{': ' + self.error if self.error else ''})"
         mode = str(CHROME.get("permission_mode") or "").strip()
@@ -826,13 +852,15 @@ class ChromeLink:
         ]
         if self.state == "connected":
             lines.insert(1, f"Browser: {self.browser or 'not checked yet'}")
+        elif self._saved.get("device_id"):
+            lines.insert(1, f"Browser: {self._saved.get('name') or '?'} ({str(self._saved['device_id'])[:8]}..., used last)")
         want = str(CHROME.get("claude_path") or "").strip()
         if want and not Path(want).expanduser().is_file():
             lines.append(f"Note: chrome.claude_path in config.json no longer exists ({want}); found Claude Code by itself instead.")
         chrome_app = APPS.get("chrome")
         if chrome_app and IS_WINDOWS:
             lines.append(f"Chrome: {app_state(chrome_app)[1]}")
-        if self.state != "connected":
+        if self.state not in ("connected", "idle") or self.error:
             lines.append("To fix: Claude Code must be installed on the PC and signed in (run `claude`, then /login) with the same "
                          "claude.ai account as the Chrome extension. Details are in logs\\chrome-mcp.log on the PC.")
         return "\n".join(lines)
@@ -1219,14 +1247,16 @@ async def quit_app(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 async def chrome_status(restart: bool = False) -> str:
-    """Is Claude in Chrome on the PC reachable through the bridge? Shows the link state, Claude Code's path and the
-    last error. restart=True restarts the bridge's connection to Claude Code's Chrome server (try it if Chrome
-    calls keep failing while Chrome is running)."""
+    """Is Claude in Chrome on the PC reachable through the bridge? Shows the link state, Claude Code's path, the
+    browser in use and the last error. 'idle' is normal: the link starts by itself on the next Chrome call.
+    restart=True (re)starts the bridge's connection to Claude Code's Chrome server and waits for it (try it if
+    Chrome calls keep failing while Chrome is running)."""
     audit("chrome_status", restart=restart)
     if restart and CHROME_LINK.state not in ("off",):
+        await asyncio.to_thread(CHROME_LINK.use)
         CHROME_LINK.restart()
         await asyncio.sleep(2)
-        await asyncio.to_thread(CHROME_LINK._ready.wait, 20)
+        await CHROME_LINK.wait_ready(45)
     return CHROME_LINK.describe()
 
 
@@ -1425,8 +1455,7 @@ def main():
         if not r.path.exists():
             log.warning("folder %s does not exist: %s", r.name, r.path)
 
-    threading.Thread(target=_background_loop, name="bridge-background", daemon=True).start()
-    CHROME_LINK.start()
+    CHROME_LINK.start()  # only sets up its thread; Claude Code's Chrome server starts on the first Chrome call
     uvicorn.run(build_app(), host="127.0.0.1", port=port, log_config=None, access_log=False,
                 proxy_headers=True, forwarded_allow_ips="127.0.0.1")
 
