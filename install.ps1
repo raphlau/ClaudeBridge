@@ -271,11 +271,18 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
     -Description 'Claude Bridge: scoped folder access for Claude via Tailscale Funnel' -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
-# Daily update check (update.ps1), also started on demand by update_bridge. An update runs this installer from
-# inside that task, so it leaves an existing update task alone.
-if (-not ($Unattended -and (Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue))) {
-    $uArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallDir\update.ps1`" -Scheduled"
-    $uAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $uArgs -WorkingDirectory $InstallDir
+# Daily update check (update.ps1), also started on demand by update_bridge. It runs in a headless console host:
+# with Windows Terminal as the default terminal, powershell's -WindowStyle Hidden still shows a window.
+# An update runs this installer from inside that task, so then it only adjusts the task's action in place.
+$uArgs = "--headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$InstallDir\update.ps1`" -Scheduled"
+$uAction = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $uArgs -WorkingDirectory $InstallDir
+$existing = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction SilentlyContinue
+if ($Unattended -and $existing) {
+    if (@($existing.Actions)[0].Execute -ne 'conhost.exe') {
+        Set-ScheduledTask -TaskName $UpdateTaskName -Action $uAction | Out-Null
+        Say "Updates now run without a window."
+    }
+} else {
     $uTrigger = New-ScheduledTaskTrigger -Daily -At '04:00' -RandomDelay (New-TimeSpan -Hours 2)
     $uSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew

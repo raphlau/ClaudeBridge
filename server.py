@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -1619,26 +1619,39 @@ async def _respond(send, status: int, body: bytes) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-async def _nothing(send) -> None:
-    """What anyone without the token gets: an empty 404, the same as an address with nothing behind it."""
-    await send({"type": "http.response.start", "status": 404, "headers": [(b"content-length", b"0")]})
-    await send({"type": "http.response.body", "body": b""})
+async def _drop(send) -> None:
+    """Answer with nothing at all: close the connection without an HTTP response. Through Funnel the sender
+    then gets Tailscale's own empty 502, the same as when the bridge is switched off."""
+    cycle = getattr(send, "__self__", None)  # uvicorn's request cycle; its send() is a bound method
+    transport = getattr(cycle, "transport", None)
+    if transport is None:  # not running under uvicorn: the closest thing is an empty 404
+        await send({"type": "http.response.start", "status": 404, "headers": [(b"content-length", b"0")]})
+        await send({"type": "http.response.body", "body": b""})
+        return
+    transport.abort()
+    cycle.disconnected = True  # so uvicorn doesn't send a 500 of its own
 
 
 def _link_miss(request: Request) -> Response:
-    """An unknown or expired one-time link: counts as a wrong token."""
-    who = _client(request.scope)
-    GUARD.bad_attempt("link", who)
-    BLOCKER.strike(who, "wrong_token")
+    """Unreachable in practice (TokenGate checks link tokens first); kept as a second line."""
     return Response(status_code=404)
 
 
+def _link_ok(path: str, method: str) -> bool:
+    """Is this a live one-time link, used the right way?"""
+    kind, want = ("download", ("GET", "HEAD")) if path.startswith("/dl/") else ("upload", ("PUT", "POST"))
+    info = LINKS.get(path[4:])
+    return bool(info) and "/" not in path[4:] and info["kind"] == kind and method in want and info["expires"] >= time.time()
+
+
 class TokenGate:
-    """Require the secret token on everything except the one-time link routes (which carry their own random
-    token) and /healthz from this PC or the tailnet. Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL
-    prefix. Everything else gets an empty 404 (see Blocker); while locked (see Guard), even the right token gets 503."""
+    """Require the secret token on everything except live one-time links (which carry their own random token)
+    and /healthz from this PC or the tailnet. Accepts 'Authorization: Bearer <token>' or a '/k/<token>' URL prefix.
+    Anything else, including paths that don't exist, gets no answer at all (see _drop and Blocker); while locked
+    (see Guard), even the right token gets 503."""
 
     LINK_PREFIXES = ("/dl/", "/ul/")
+    ENDPOINTS = ("/mcp", "/mcp/", "/healthz")
 
     def __init__(self, app, token: str):
         self.app = app
@@ -1667,13 +1680,19 @@ class TokenGate:
                 await asyncio.sleep(1.0)
                 return await _respond(send, 503, json.dumps({"error": "Claude Bridge is locked after repeated wrong-token "
                                       f"requests, until {fmt_time(GUARD.until)}. Unlock on the PC: bridge.cmd unlock"}).encode())
+            if scope.get("path") not in self.ENDPOINTS:
+                return await _drop(send)  # nothing else exists, even with the token
             return await self.app(scope, receive, send)
         if path == "/healthz" and _own_network(who):
             return await self.app(scope, receive, send)
         if BLOCKER.is_blocked(who) or GUARD.locked():
-            return await _nothing(send)
+            return await _drop(send)
         if path.startswith(self.LINK_PREFIXES) and not presented:
-            return await self.app(scope, receive, send)  # the link routes check their own token
+            if _link_ok(path, scope.get("method", "")):
+                return await self.app(scope, receive, send)
+            GUARD.bad_attempt("link", who)
+            BLOCKER.strike(who, "wrong_token")
+            return await _drop(send)
         if presented:
             GUARD.bad_attempt("connector", who)
             BLOCKER.strike(who, "wrong_token")
@@ -1682,7 +1701,7 @@ class TokenGate:
             log.info("no token: %s from %s", path[:40], who)
             if not path.startswith("/.well-known/"):  # Claude's connector checks these for OAuth; never count them
                 BLOCKER.strike(who, "no_token")
-        return await _nothing(send)
+        return await _drop(send)
 
 
 def build_app():

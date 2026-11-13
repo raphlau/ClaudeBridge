@@ -28,6 +28,12 @@ jobs:
           python3 -m py_compile server.py selftest.py
           echo "VERSION=$ver" >> "$GITHUB_ENV"
 
+      - name: Check dependencies for known vulnerabilities
+        run: |
+          set -euo pipefail
+          pipx run uv export --frozen --no-hashes --no-dev --format requirements-txt -o req.txt
+          pipx run pip-audit -r req.txt --disable-pip --no-deps --progress-spinner off
+
       - name: Build
         run: |
           set -euo pipefail

@@ -1,0 +1,23 @@
+# Weekly check of the locked Python dependencies (uv.lock) against public vulnerability advisories (PyPI/OSV).
+# If one turns up, this run fails and GitHub emails you; then update the lock (uv lock --upgrade-package <name>)
+# and make a release, and the PCs pick it up within a day.
+name: Dependency audit
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check dependencies for known vulnerabilities
+        run: |
+          set -euo pipefail
+          pipx run uv export --frozen --no-hashes --no-dev --format requirements-txt -o req.txt
+          pipx run pip-audit -r req.txt --disable-pip --no-deps --progress-spinner off

@@ -36,7 +36,7 @@ In the connector's tool permissions, consider "ask before running" for the tools
 ## What keeps it safe
 
 - **The token:** 256 bits from Windows' cryptographic random generator, made on your PC by the installer. It's stored in `config.json`, readable only by you. It's checked on every request, in constant time.
-- **Nothing to see without the token:** every request without the right token gets an empty 404, as if there were nothing there. Addresses that keep trying get ignored, and repeated wrong tokens lock the bridge and alert you (see [Blocking, lockout and alerts](#blocking-lockout-and-alerts)).
+- **Nothing to see without the token:** a request without the right token, or to a path that doesn't exist, gets no answer at all. The bridge just closes the connection. Addresses that keep trying get ignored, and repeated wrong tokens lock the bridge and alert you (see [Blocking, lockout and alerts](#blocking-lockout-and-alerts)).
 - **Only your two folders:** there are no commands or shell. Paths outside the folders, `..`, symlink tricks and odd Windows names (`:` streams, `CON`, trailing dots) are refused.
 - **Nothing is deleted or moved,** and before any change the previous version is copied to `%LOCALAPPDATA%\ClaudeBridge\history` (kept 30 days).
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
@@ -49,7 +49,7 @@ What remains: anyone with the token can do what Claude can. That includes acting
 
 ## Blocking, lockout and alerts
 
-**Without the token:** the public address answers every request with an empty 404, including `/healthz`. `/healthz` answers only on this PC and your tailnet. Tailscale still completes the HTTPS handshake; nothing on the PC can prevent that.
+**Without the token:** the bridge sends no HTTP answer at all; it closes the connection. This applies to every path, including `/healthz` (which answers only on this PC, on your tailnet, or with the token) and paths that don't exist. Tailscale's relay still completes the HTTPS handshake, and turns the closed connection into its own empty `502`, the same as when the bridge is switched off.
 
 **Blocking addresses:** an internet address that sends 5 requests without a token, or 3 with a wrong one, within 10 minutes is ignored for 24 hours, and its attempts stop counting toward the lockout below. So a single attacker can't lock you out. It never blocks:
 - this PC or your tailnet;
@@ -67,6 +67,24 @@ What remains: anyone with the token can do what Claude can. That includes acting
 **Ending it early:** `bridge.cmd unlock`. If the wrong tokens weren't yours, also run `bridge.cmd rotate-token` and update the connector in Claude.
 
 **Settings** (under `"security"`): `block_after_no_token`, `block_after_wrong_token`, `block_hours`, `max_bad_tokens`, `window_minutes`, `lockout_minutes`. `bridge.cmd unlock` also clears blocked addresses.
+
+## What Funnel exposes
+
+**Only one thing:** HTTPS on port 443 of this PC's `*.ts.net` name, forwarded to the bridge on `127.0.0.1:8765`. The installer sets it up (`tailscale funnel --bg --https=443 http://127.0.0.1:8765`), and Tailscale keeps the setting on the PC. See it with:
+
+```powershell
+tailscale funnel status
+tailscale serve status --json
+```
+
+**Nothing else is reachable from the internet:**
+- Tailscale opens no ports on your router: traffic comes in through Tailscale's relays over the PC's own outbound connection.
+- Funnel can only use ports 443, 8443 and 10000; the other two aren't set up.
+- The bridge itself listens on `127.0.0.1` only.
+
+Separately, devices on your **tailnet** (not the internet) can reach the PC like a local network, under your Tailscale access rules. `bridge.cmd off` removes the Funnel.
+
+**Dependencies:** they're pinned in `uv.lock`. Every release, and a weekly job, check them against public vulnerability advisories. A failed weekly run means GitHub emails you; then update the lock and release.
 
 ## Chrome on the PC
 
