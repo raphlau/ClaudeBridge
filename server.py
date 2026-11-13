@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -176,8 +176,7 @@ def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) ->
     is_dir = real.is_dir()
     if (rel and _denied(rel, is_dir)) or (real_rel and _denied(real_rel, is_dir)):
         raise BridgeError("That path is excluded by the bridge's deny list")
-    if not want_write:
-        sync_for_read(root)  # writes do this (and report it) themselves
+    sync_first(root)  # reads and writes alike: start the sync app (and let it catch up) before touching files
     if must_exist and not real.exists():
         raise BridgeError(f"Not found: {root.name}/{rel}")
     return root, real, f"{root.name}/{rel}".rstrip("/")
@@ -498,17 +497,97 @@ def ensure_for(root: Root) -> str:
 
 
 _sync_checked: dict[str, float] = {}
+_sync_locks: dict[str, threading.Lock] = {}
+SYNC_WAIT_SECONDS = 45  # the most a file tool waits for a sync app it just started
+
+# Asks MEGA's Explorer integration (the overlay handlers behind its green tick / blue arrows) whether a folder is
+# synced, until it is. Runs in its own short-lived process so MEGA's shell DLL never loads into the bridge.
+_MEGA_WAIT = r"""
+import sys, time, pythoncom
+from win32com.shell import shell
+path, limit = sys.argv[1], float(sys.argv[2])
+pythoncom.CoInitialize()
+def handler(clsid):
+    return pythoncom.CoCreateInstance(clsid, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellIconOverlayIdentifier)
+try:
+    synced, syncing, pending = (handler(c) for c in ("{05B38830-F4E9-4329-978B-1DD28605D202}",
+        "{0596C850-7BDD-4C9D-AFDF-873BE6890637}", "{056D528D-CE28-4194-9BA3-BA2E9197FF8C}"))
+except Exception:
+    print("unknown"); sys.exit()
+start, ok_since = time.time(), None
+while time.time() - start < limit:
+    done = synced.IsMemberOf(path, 0) == 0 and syncing.IsMemberOf(path, 0) != 0 and pending.IsMemberOf(path, 0) != 0
+    now = time.time()
+    ok_since = (ok_since or now) if done else None
+    if ok_since and now - start >= 5 and now - ok_since >= 2:
+        print(f"synced after {int(now - start)} s"); sys.exit()
+    time.sleep(1)
+print(f"still syncing after {int(limit)} s")
+"""
 
 
-def sync_for_read(root: Root) -> str:
-    """When a folder is read: start its sync app if it isn't running, so it pulls in recent changes. Checked at most
-    once a minute per app; says something only when it had to start the app."""
+def _wait_mega(root: Root, limit: float) -> str:
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", _MEGA_WAIT, str(root.path), str(limit)], capture_output=True,
+                           text=True, timeout=limit + 30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (r.stdout or "").strip().splitlines()
+        return out[-1] if out else "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _signature(folder: Path) -> tuple[int, int, int]:
+    """(files, total size, newest change) of a folder, skipping dot-folders such as .obsidian."""
+    count = size = newest = 0
+    stack = [str(folder)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    else:
+                        st = e.stat(follow_symlinks=False)
+                        count, size, newest = count + 1, size + st.st_size, max(newest, st.st_mtime_ns)
+        except OSError:
+            pass
+    return count, size, newest
+
+
+def _wait_quiet(root: Root, app: App, limit: float) -> str:
+    """No sync status to ask for (Obsidian Sync): wait until the app is ready (vault open) and the folder's files
+    have stopped changing for a few seconds."""
+    start, last, stable_since = time.time(), None, time.time()
+    while time.time() - start < limit:
+        sig, now = _signature(root.path), time.time()
+        if sig != last:
+            last, stable_since = sig, now
+        elif now - start >= 6 and now - stable_since >= 4 and app_state(app)[0]:
+            return f"settled after {int(now - start)} s"
+        time.sleep(1)
+    return f"still changing after {int(limit)} s"
+
+
+def sync_first(root: Root) -> None:
+    """Before a file tool touches a folder: start its sync app if it isn't running, and if it had to, wait until it
+    has caught up (MEGA says the folder is synced; for Obsidian, the vault stops changing), so reads aren't stale
+    and edits don't land on an old copy. Checked at most once a minute per app."""
     key = (root.sync_app or "").lower()
-    if not key or time.time() - _sync_checked.get(key, 0) < 60:
-        return ""
-    _sync_checked[key] = time.time()
-    msg = ensure_app(root.sync_app)
-    return f"\n({msg}, so recent changes from other devices may still be arriving.)" if "started it" in msg else ""
+    app = APPS.get(key)
+    if not app or not IS_WINDOWS:
+        return
+    with _sync_locks.setdefault(key, threading.Lock()):  # a second call meanwhile waits for the same start
+        if time.time() - _sync_checked.get(key, 0) < 60:
+            return
+        msg = ensure_app(root.sync_app)
+        if "started it" in msg:
+            how = _wait_mega(root, SYNC_WAIT_SECONDS) if key == "mega" else "unknown"
+            if how == "unknown":
+                how = _wait_quiet(root, app, SYNC_WAIT_SECONDS)
+            log.info("%s: started it for %s; %s", app.name, root.name, how)
+        _sync_checked[key] = time.time()
 
 
 # ---------------------------------------------------------------- Claude in Chrome (through Claude Code)
@@ -1029,10 +1108,10 @@ def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) ->
     if not path.strip().strip("/"):
         lines = ["Shared folders:"]
         for r in ROOTS.values():
-            started = sync_for_read(r)
+            sync_first(r)
             state = "ok" if r.path.exists() else "MISSING on disk"
             app = APPS.get(r.sync_app.lower()) if r.sync_app else None
-            synced = (f", synced by {app.name}: " + ("just started it" if started else app_state(app)[1])) if app and IS_WINDOWS else \
+            synced = (f", synced by {app.name}: {app_state(app)[1]}") if app and IS_WINDOWS else \
                      ("" if app else ", no sync app found for it")
             lines.append(f"- {r.name}  ({state}{synced})")
         return "\n".join(lines)
@@ -1079,7 +1158,7 @@ def find_files(pattern: str, path: str = "", max_results: int = 200) -> str:
     is_glob = any(c in pat for c in "*?[")
     targets = [resolve(path)[:2]] if path.strip("/ ") else [(r, r.path) for r in ROOTS.values() if r.path.exists()]
     for r, _ in targets:
-        sync_for_read(r)
+        sync_first(r)
     out, scanned = [], 0
     for root, start in targets:
         for full, rel in walk(root, start):
@@ -1107,7 +1186,7 @@ def search_text(query: str, path: str = "", regex: bool = False, file_glob: str 
         raise BridgeError(f"Bad regex: {e}")
     targets = [resolve(path)[:2]] if path.strip("/ ") else [(r, r.path) for r in ROOTS.values() if r.path.exists()]
     for r, _ in targets:
-        sync_for_read(r)
+        sync_first(r)
     out, scanned, hits = [], 0, 0
     ctx = max(0, min(context_lines, 5))
     for root, start in targets:

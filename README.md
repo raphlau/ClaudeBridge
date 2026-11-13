@@ -158,7 +158,9 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 ## Good to know
 
-- **Sync apps:** the bridge works out by itself which app syncs each folder: Obsidian if the folder is in a vault (`.obsidian`), MEGA if it's in a MEGA sync (`.megaignore` or `.debris`). It starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. Chrome is started whenever a Chrome tool needs it. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
+- **Sync apps:** the bridge works out by itself which app syncs each folder: Obsidian if the folder is in a vault (`.obsidian`), MEGA if it's in a MEGA sync (`.megaignore` or `.debris`). It starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. If it had to start it, the file operation waits until the app has caught up, for at most 45 seconds:
+  - **MEGA:** until MEGA reports the folder as synced (the same status as its Explorer icons).
+  - **Obsidian:** until the vault is open and its files have stopped changing for a few seconds. Chrome is started whenever a Chrome tool needs it. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
 - **Restoring a file:** copies are in `history\<Files|Notes>\...\<file>.<date-time>`, or use your sync app's version history.
 - **Keeping it reachable:**
   - **Sleep:** set sleep to Never when plugged in, and closing the lid to "Do nothing".

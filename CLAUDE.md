@@ -59,7 +59,8 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   path: `_detect_apps` works out the sync app from markers in the folder (`.obsidian`; `.megaignore`/`.debris`) and
   finds MEGA, Obsidian and Chrome on the PC. Don't reintroduce per-folder app settings.
 - The server must not do anything by itself while unused: no timers or watchers. Sync apps (MEGA/Obsidian) are
-  started when a file tool touches their folder (`sync_for_read` via `resolve`, `ensure_for` on writes), Chrome when a
+  started when a file tool touches their folder (`sync_first` via `resolve`, which then waits for them to catch up:
+  MEGA via its Explorer overlay status in a subprocess, Obsidian by vault quiescence), Chrome when a
   Chrome tool needs it (`ChromeLink._start_chrome`), history is pruned from `keep_history`, and the Chrome child starts
   on the first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
 - The tool set is deliberate (README "Tools"): don't add app-control or browser-picking tools back. Unwanted Claude in
