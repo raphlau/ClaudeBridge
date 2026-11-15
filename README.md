@@ -35,7 +35,7 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 ## Tools
 
-28 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
+30 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
 
 | Tool | What it does | Suggested |
 |---|---|---|
@@ -50,6 +50,8 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 | `edit_text` | replace a passage in a file | Ask |
 | `append_text` | add to the end of a file | Ask |
 | `make_folder` | create a folder | Ask |
+| `delete_files` | delete files or empty folders, when you asked or agreed (each is kept in history first) | Ask |
+| `restore_file` | list the copies history kept of a file, or put one back | Ask |
 | `create_upload_link` | one-time link to put a file from Claude's workspace onto the PC | Ask |
 | `chrome_status` | Chrome link status; picks the browser if the bridge can't tell | Allow |
 | `update_bridge` | check for a new version, or install it | Ask |
@@ -72,7 +74,7 @@ Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_bro
 - **The token:** 256 bits from Windows' cryptographic random generator, made on your PC by the installer. It's stored in `config.json`, readable only by you. It's checked on every request, in constant time.
 - **Nothing to see without the token:** a request without the right token, or to a path that doesn't exist, gets no answer at all. The bridge just closes the connection. Addresses that keep trying get ignored, and repeated wrong tokens lock the bridge and alert you (see [Blocking, lockout and alerts](#blocking-lockout-and-alerts)).
 - **Only your two folders:** there are no commands or shell. Paths outside the folders, `..`, symlink tricks and odd Windows names (`:` streams, `CON`, trailing dots) are refused.
-- **Nothing is deleted or moved,** and before any change the previous version is copied to `%LOCALAPPDATA%\ClaudeBridge\history` (kept 30 days).
+- **Every change and deletion can be undone:** before a file is changed or deleted, the bridge keeps it in `%LOCALAPPDATA%\ClaudeBridge\history` for 30 days, and `restore_file` puts it back. `delete_files` is only for files you asked for or agreed to, or redundant files Claude made itself. It never deletes through links or deletes a folder with anything left in it, and the Claude app asks you before each call (it's marked destructive). Nothing is moved.
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
 - **Hidden:** `.obsidian` (plugin code and settings), `.git`, `.ssh`, password databases and key files.
 - **Secret files are link-only:** a file with `.secret` in its name (`synci-token.secret.txt`, `api.secret`) is for tokens, API keys and passwords that Claude's scripts need. It's listed, marked `[secret: link only]`, and Claude can fetch it with a download link, which then works once, for at most 5 minutes, or replace it with an upload link. The bytes go straight between the PC and a file in Claude's workspace. No tool reads, searches, edits or attaches it to a web page, so its contents can't end up in a chat, even by a fallback or a mistake. Every refusal tells Claude the right way to use it instead: save it to a private file, let the script read it from there, never print it. Change the pattern with `secret_files` in `config.json`.
@@ -165,7 +167,7 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 - **Sync apps:** the bridge works out by itself which app syncs each folder: Obsidian if the folder is in a vault (`.obsidian`), MEGA if it's in a MEGA sync (`.megaignore` or `.debris`). It starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. If it had to start it, the file operation waits until the app has caught up, for at most 45 seconds:
   - **MEGA:** until MEGA reports the folder as synced (the same status as its Explorer icons).
   - **Obsidian:** until the vault is open and its files have stopped changing for a few seconds. Chrome is started whenever a Chrome tool needs it. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
-- **Restoring a file:** copies are in `history\<Files|Notes>\...\<file>.<date-time>`, or use your sync app's version history.
+- **Restoring a file:** ask Claude (`restore_file`), or copy it back yourself from `history\<Files|Notes>\...\<file>.<date-time>` (deleted files end in `.deleted`). After 30 days, your sync app's version history or Rubbish bin may still have it.
 - **Keeping it reachable:**
   - **Sleep:** set sleep to Never when plugged in, and closing the lid to "Do nothing".
   - **Windows updates:** turn on *Sign-in options > "Use my sign-in info to automatically finish setting up after an update"*, so the bridge comes back after an update restart.

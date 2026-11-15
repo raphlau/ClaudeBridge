@@ -45,11 +45,12 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
 
 ## Rules
 
-- Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no delete
-  or move tools, no app-control tools, `.obsidian`/`.git`/keys hidden, secret files (`SECRET_FILES`, `.secret` in the name) link-only:
+- Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no move tool,
+  deletion only through `delete_files` (moves files into history, recoverable with `restore_file`; files and empty
+  folders only, never through links, never recursive), no app-control tools, `.obsidian`/`.git`/keys hidden, secret files (`SECRET_FILES`, `.secret` in the name) link-only:
   no tool returns, searches, edits or attaches their contents, history copy before every change,
   no writing programs/scripts/shortcuts (`DENY_WRITE_EXTS`), uploads get Mark-of-the-Web, wrong-token lockout
-  (`Guard`). Don't add a shell or delete tool. Never let attacker-controlled text (headers, paths) reach a
+  (`Guard`). Don't add a shell, a move tool or a recursive delete. Never let attacker-controlled text (headers, paths) reach a
   command line: `send_alert` passes the toast XML via an environment variable for that reason.
 - Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
   `file_upload` is the bridge's own (`FILE_UPLOAD_TOOL`): it takes Files/Notes paths, checks them with `resolve` and
