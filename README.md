@@ -39,13 +39,13 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 | Tool | What it does | Suggested |
 |---|---|---|
-| `list_dir` | list a folder, or the shared folders | Allow |
+| `list_dir` | list a folder, or the shared folders (secret files are marked) | Allow |
 | `find_files` | find files by name | Allow |
 | `search_text` | search inside text files | Allow |
 | `read_text` | read a text file | Allow |
 | `read_pdf` | read a PDF's text | Allow |
 | `view_file` | see an image or a PDF page | Allow |
-| `create_download_link` | short-lived link to fetch one file into Claude's workspace | Allow |
+| `create_download_link` | short-lived link to fetch one file into Claude's workspace (for a secret file: one use, 5 minutes) | Allow |
 | `write_text` | create a file, or replace one when asked | Ask |
 | `edit_text` | replace a passage in a file | Ask |
 | `append_text` | add to the end of a file | Ask |
@@ -75,6 +75,7 @@ Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_bro
 - **Nothing is deleted or moved,** and before any change the previous version is copied to `%LOCALAPPDATA%\ClaudeBridge\history` (kept 30 days).
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
 - **Hidden:** `.obsidian` (plugin code and settings), `.git`, `.ssh`, password databases and key files.
+- **Secret files are link-only:** a file with `.secret` in its name (`synci-token.secret.txt`, `api.secret`) is for tokens, API keys and passwords that Claude's scripts need. It's listed, marked `[secret: link only]`, and Claude can fetch it with a download link, which then works once, for at most 5 minutes, or replace it with an upload link. The bytes go straight between the PC and a file in Claude's workspace. No tool reads, searches, edits or attaches it to a web page, so its contents can't end up in a chat, even by a fallback or a mistake. Every refusal tells Claude the right way to use it instead: save it to a private file, let the script read it from there, never print it. Change the pattern with `secret_files` in `config.json`.
 - **Chrome:** everything happens inside Chrome, under the Claude in Chrome extension's own site permissions.
 - **Uploads to websites only from Files and Notes:** `file_upload` takes bridge paths, which are checked like any other file tool, so hidden folders, keys and password files are excluded. The bridge then hands Chrome the files' contents. Claude Code itself can't read files on the PC, so nothing else can be uploaded.
 - **Updates come only from this repo's releases,** checked against their SHA-256. An update never turns a switched-off bridge back on.
@@ -176,7 +177,8 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 ## Making a release
 
-1. Bump `VERSION` in `server.py` and commit.
-2. Push a matching tag: `git tag v1.6.1`, then `git push origin main v1.6.1`.
+1. Run the tests: `uv run python -m unittest discover -s tests`.
+2. Bump `VERSION` in `server.py` and commit.
+3. Push a matching tag: `git tag v1.6.1`, then `git push origin main v1.6.1`.
 
 The `Release` workflow checks the tag against `VERSION`, checks that the scripts are ASCII and that the Python compiles, then publishes `ClaudeBridge.zip`, its SHA-256, `version.txt` and `get.ps1`. PCs pick it up within a day.

@@ -30,6 +30,10 @@
     "id_rsa*",
     "id_ed25519*"
   ],
+  "secret_files": [
+    "*.secret",
+    "*.secret.*"
+  ],
   "limits": {
     "max_upload_mb": 500,
     "link_minutes": 15
