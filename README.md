@@ -177,8 +177,10 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 ## Making a release
 
-1. Run the tests: `uv run python -m unittest discover -s tests`.
-2. Bump `VERSION` in `server.py` and commit.
-3. Push a matching tag: `git tag v1.6.1`, then `git push origin main v1.6.1`.
+Releases are automatic: **whatever is merged into `main` is released**, as long as `VERSION` in `server.py` is new.
 
-The `Release` workflow checks the tag against `VERSION`, checks that the scripts are ASCII and that the Python compiles, then publishes `ClaudeBridge.zip`, its SHA-256, `version.txt` and `get.ps1`. PCs pick it up within a day.
+1. Make the change on a branch, bump `VERSION` in `server.py`, and run the tests: `uv run python -m unittest discover -s tests`.
+2. Open a pull request. The `Release` workflow runs on it: version check, ASCII scripts, Python compiles, tests, dependency audit and the build, without publishing.
+3. Merge it. The workflow runs the same checks on `main`, tags `v<VERSION>` and publishes `ClaudeBridge.zip`, its SHA-256, `version.txt` and `get.ps1`. PCs pick it up within a day, or straight away with `bridge.cmd update`.
+
+If a change to anything that ships reaches `main` without a `VERSION` bump, the run fails and GitHub emails you; bump `VERSION` and merge again. Changes to `README.md` or `CLAUDE.md` alone don't make a release; they go out with the next one. Don't push tags by hand.

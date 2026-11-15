@@ -1,32 +1,73 @@
-# Builds a release when a version tag is pushed (git tag v1.4.0, then git push origin v1.4.0).
-# The tag must match VERSION in server.py. get.ps1 (install) and update.ps1 (updates) download the release's
-# ClaudeBridge.zip, ClaudeBridge.zip.sha256 and version.txt from github.com/<repo>/releases.
+# Releases main automatically. Every push to main (normally a merged pull request) runs the checks and tests, and
+# if VERSION in server.py hasn't been released yet, tags v<VERSION> on that commit and publishes the release.
+# get.ps1 (install) and update.ps1 (updates) download its ClaudeBridge.zip, ClaudeBridge.zip.sha256 and version.txt,
+# and the PCs install it within a day.
+# A change to anything that ships, without a VERSION bump, fails the run (and GitHub emails Raph), so main never
+# quietly differs from what the PCs run. Docs-only changes (README.md, CLAUDE.md) just wait for the next release.
+# Pull requests into main get the same checks, tests and build, without publishing.
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # what a release installs on the PCs, apart from the docs
+      SHIPPED: server.py selftest.py pyproject.toml uv.lock install.ps1 install.cmd update.ps1 bridge.ps1 bridge.cmd config.example.json get.ps1
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # tags and history, for the version check and the release notes
 
       - name: Check version and scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
           ver="$(sed -nE 's/^VERSION = "([0-9.]+)"\r?$/\1/p' server.py)"
-          if [ "$tag" != "$ver" ]; then echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION \"$ver\" in server.py"; exit 1; fi
+          if [ -z "$ver" ]; then echo "::error::No VERSION = \"x.y.z\" line in server.py"; exit 1; fi
           if LC_ALL=C grep -nP '[^\x00-\x7F]' *.ps1 *.cmd; then echo "::error::.ps1/.cmd files must be ASCII-only (Windows PowerShell 5.1)"; exit 1; fi
           python3 -m py_compile server.py selftest.py
-          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          prev="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          publish=yes
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            publish=no
+            # shellcheck disable=SC2086
+            if ! git diff --quiet "v$ver" HEAD -- $SHIPPED; then
+              echo "::error::Files that ship changed since v$ver was released, but VERSION is still $ver. Bump VERSION in server.py."
+              git diff --stat "v$ver" HEAD -- $SHIPPED
+              exit 1
+            fi
+            echo "v$ver is already released and nothing that ships has changed: no new release."
+          elif git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
+            echo "::error::Tag v$ver exists but has no release. Bump VERSION, or delete the tag so this commit can be released as v$ver."
+            exit 1
+          elif [ -n "$prev" ] && [ "$(printf '%s\n%s\n' "${prev#v}" "$ver" | sort -V | tail -n1)" != "$ver" ]; then
+            echo "::error::VERSION $ver isn't newer than the latest release, $prev."
+            exit 1
+          else
+            echo "VERSION $ver is new: it will be released as v$ver (previous: ${prev:-none})."
+          fi
+          { echo "VERSION=$ver"; echo "PREV=$prev"; echo "PUBLISH=$publish"; } >> "$GITHUB_ENV"
+
+      - name: Tests
+        run: |
+          set -euo pipefail
+          pipx run uv sync --frozen
+          pipx run uv run python -m unittest discover -s tests -v
 
       - name: Check dependencies for known vulnerabilities
         run: |
@@ -43,17 +84,18 @@ jobs:
           (cd dist && sha256sum ClaudeBridge.zip | cut -d' ' -f1 > ClaudeBridge.zip.sha256)
           printf '%s\n' "$VERSION" > dist/version.txt
           cp get.ps1 dist/get.ps1
-          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
           {
             echo "Install or update on Windows, in PowerShell opened from the Start menu:"
             echo; echo '```powershell'
             echo "irm https://github.com/$GITHUB_REPOSITORY/releases/latest/download/get.ps1 | iex"
             echo '```'; echo
             echo "Changes:"
-            git log --no-merges --pretty='- %s' ${prev:+$prev..}"$GITHUB_REF_NAME"
+            git log --no-merges --pretty='- %s' ${PREV:+$PREV..}HEAD
           } > notes.md
+          cat notes.md
 
       - name: Publish the release
+        if: env.PUBLISH == 'yes' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Claude Bridge $VERSION" --notes-file notes.md
+        run: gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "Claude Bridge $VERSION" --notes-file notes.md

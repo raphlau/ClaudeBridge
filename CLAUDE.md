@@ -38,10 +38,13 @@ README.md for the design.
 
 The repo (raphlau/ClaudeBridge) is public; `.github/workflows/release.yml` publishes GitHub releases of it with the
 built-in workflow token. Never commit config.json, connector.txt, logs or anything else with the token or personal paths.
-1. Bump `VERSION` in server.py and commit.
-2. Tag `v<VERSION>` and push the tag.
-3. The workflow refuses a tag that doesn't match `VERSION`, and fails on non-ASCII .ps1/.cmd files.
-4. Add any new file the install needs to both the workflow's zip list and install.ps1's copy list.
+**Everything merged into `main` is released automatically** and reaches both PCs within a day, so `main` is production:
+1. Never push to `main` directly. Work on a branch, bump `VERSION` in server.py for any change to what ships, run the
+   tests, and open a pull request for Raph to review and merge. The workflow checks the PR without publishing.
+2. On `main`, the workflow tags `v<VERSION>` and publishes the release if that version is new. It fails if shipped files
+   changed without a `VERSION` bump, or if `VERSION` isn't newer than the latest release, and on non-ASCII .ps1/.cmd files
+   or failing tests. Docs-only changes (README.md, CLAUDE.md) don't release. Don't push tags by hand.
+3. Add any new file the install needs to the workflow's zip list and `SHIPPED`, and to install.ps1's copy list.
 
 ## Rules
 
