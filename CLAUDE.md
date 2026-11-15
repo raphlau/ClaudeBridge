@@ -46,7 +46,8 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
 ## Rules
 
 - Keep the security model intact: server binds 127.0.0.1 only, token required on every MCP request, no delete
-  or move tools, no app-control tools, `.obsidian`/`.git`/keys hidden, history copy before every change,
+  or move tools, no app-control tools, `.obsidian`/`.git`/keys hidden, secret files (`SECRET_FILES`, `.secret` in the name) link-only:
+  no tool returns, searches, edits or attaches their contents, history copy before every change,
   no writing programs/scripts/shortcuts (`DENY_WRITE_EXTS`), uploads get Mark-of-the-Web, wrong-token lockout
   (`Guard`). Don't add a shell or delete tool. Never let attacker-controlled text (headers, paths) reach a
   command line: `send_alert` passes the toast XML via an environment variable for that reason.
@@ -73,5 +74,6 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   never print the token: install.ps1 -Unattended output goes into logs\update.log.
 - Never paste the token into anything other than this machine's files or the chat with Raph.
 - Windows PowerShell 5.1 compatibility matters (no `&&`, `??`, ternaries); keep .ps1 files ASCII-only.
-- After changing `server.py`, restart with `bridge.cmd restart` and re-run the self-test.
+- After changing `server.py`, run `uv run python -m unittest discover -s tests`, restart with `bridge.cmd restart`
+  and re-run the self-test. A new tool that reads a shared file must call `refuse_secret` (see tests/test_secret_files.py).
 - Python deps are locked in `uv.lock`; use `uv sync --frozen` (or `uv lock` if you deliberately change deps).

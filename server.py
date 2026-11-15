@@ -41,7 +41,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -82,6 +82,12 @@ LIMITS = {
 DENY_FOLDERS = {s.lower() for s in CFG.get("deny_folders", [".git", ".obsidian", ".ssh", ".gnupg", ".debris", "$recycle.bin"])}
 # Any file whose name matches one of these globs is hidden.
 DENY_FILES = [s.lower() for s in CFG.get("deny_files", ["*.kdbx", "*.kdb", ".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*"])]
+# Secret files (tokens, API keys, passwords) are link-only. They're listed, and Claude can fetch or replace one with
+# a download or upload link, so the bytes go straight between the PC and a file in Claude's workspace. But no tool
+# returns, searches, edits or attaches their contents, so a secret can't end up in a chat. A file is secret when its
+# name matches one of these globs: put ".secret" in the name, e.g. "synci-token.secret.txt".
+SECRET_FILES = [s.lower() for s in CFG.get("secret_files", ["*.secret", "*.secret.*"])]
+SECRET_LINK_MINUTES = 5  # download links for secret files work once, for at most this long
 # Never written, created or uploaded: things Windows runs or follows when opened or merely shown in Explorer
 # (programs, scripts, shortcuts, installers). Reading them is still allowed.
 DENY_WRITE_EXTS = {s.lower() for s in CFG.get("deny_write_exts", [
@@ -140,6 +146,43 @@ def _denied(rel: str, is_dir: bool = False) -> bool:
     if any(p in DENY_FOLDERS for p in folders):
         return True
     return not is_dir and any(fnmatch.fnmatch(parts[-1], pat) for pat in DENY_FILES)
+
+
+def is_secret(*paths: Path | str) -> bool:
+    """Is any of these (the path asked for, the real path it leads to) named as a secret file? Callers rule out
+    folders. Both are checked so a link or junction with an innocent name can't reach a secret."""
+    for p in paths:
+        name = str(p).replace("\\", "/").rstrip("/").rpartition("/")[2].lower()
+        if name and any(fnmatch.fnmatch(name, pat) for pat in SECRET_FILES):
+            return True
+    return False
+
+
+SECRET_TAG = "[secret: link only]"
+# What Claude is told whenever a tool refuses a secret file, and with every link made for one.
+SECRET_HOW_TO_USE = (
+    "To use it: call create_download_link (for a secret, the link works once, for a few minutes). In your own "
+    "workspace, save it straight to a private file, e.g. mkdir -p ~/secret && chmod 700 ~/secret && "
+    "curl -sS -o ~/secret/NAME URL && chmod 600 ~/secret/NAME. Then have the script or program that needs it read it "
+    "from that file (for example a script that opens the file and sends it as an Authorization header), never as a "
+    "command-line argument. Never print, cat, echo, grep, diff or log it, and never put it in a reply, note, memory, "
+    "code, commit or another file. If the link can't be fetched, don't look for another way to read it: say so and "
+    "use another route. Delete your copy when you're done.")
+SECRET_HOW_TO_REPLACE = (
+    "Secret files are only created or replaced with create_upload_link (overwrite=True to replace one), uploading "
+    "from a private file in your workspace with curl -T, so the contents never pass through the chat. If the text you "
+    "just sent was a real secret, it is now in this chat: tell Raph, so he can decide whether to renew it.")
+
+
+def secret_refusal(disp: str, what: str, *, write: bool = False) -> "BridgeError":
+    return BridgeError(f"{disp} is a secret file ('.secret' in its name), so the bridge won't {what}: its contents must "
+                       "never appear in a chat. " + (SECRET_HOW_TO_REPLACE if write else SECRET_HOW_TO_USE))
+
+
+def refuse_secret(real: Path, disp: str, what: str, *, write: bool = False) -> None:
+    """Raise if this is a secret file. For writes the name decides (the file may not exist yet)."""
+    if (not real.is_dir() if write else real.is_file()) and is_secret(disp, real):
+        raise secret_refusal(disp, what, write=write)
 
 
 def resolve(vpath: str, *, want_write: bool = False, must_exist: bool = True) -> tuple[Root, Path, str]:
@@ -234,13 +277,20 @@ def audit(tool: str, **kw: Any) -> None:
 LINKS: dict[str, dict[str, Any]] = {}
 
 
-def _new_link(kind: str, real: Path, display: str, minutes: int, overwrite: bool = False, root: "Root | None" = None) -> str:
+def link_minutes(minutes: int, secret: bool = False) -> int:
+    return max(1, min(int(minutes or LIMITS["link_minutes"]), SECRET_LINK_MINUTES if secret else 120))
+
+
+def _new_link(kind: str, real: Path, display: str, minutes: int, overwrite: bool = False, root: "Root | None" = None,
+              once: bool = False) -> str:
+    """Upload links always work once; download links work once when once=True (secret files)."""
     now = time.time()
     for t in [t for t, v in LINKS.items() if v["expires"] < now]:
         LINKS.pop(t, None)
-    minutes = max(1, min(int(minutes or LIMITS["link_minutes"]), 120))
+    minutes = link_minutes(minutes, once)
     tok = secrets.token_urlsafe(32)
-    LINKS[tok] = {"kind": kind, "path": real, "display": display, "expires": now + minutes * 60, "overwrite": overwrite, "root": root}
+    LINKS[tok] = {"kind": kind, "path": real, "display": display, "expires": now + minutes * 60, "overwrite": overwrite,
+                  "root": root, "once": once}
     base = CFG.get("public_url", "").rstrip("/")
     if not base:
         raise BridgeError("Set 'public_url' in config.json to use links")
@@ -623,7 +673,8 @@ FILE_UPLOAD_TOOL = Tool.model_validate({
         "Attach files from Files or Notes to a file input on the current page, e.g. attachments to an email. "
         "Don't click the page's upload/attach button (that opens a file picker you can't use): use find or read_page "
         "to get the file input's ref, then call this. Up to 10 MB in total. Only files in Files and Notes can be used; "
-        "the site must be allowed in the Claude in Chrome extension."),
+        "the site must be allowed in the Claude in Chrome extension. Secret files ('.secret' in the name) can't be "
+        "attached."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -651,6 +702,7 @@ def _upload_files(paths: Any) -> list[dict[str, str]]:
         root, real, disp = resolve(str(p))
         if not real.is_file():
             raise BridgeError(f"{disp} is not a file")
+        refuse_secret(real, disp, "attach it to a web page")
         total += real.stat().st_size
         if total > UPLOAD_MAX_BYTES:
             raise BridgeError("Too big: files attached in one go must stay under 10 MB in total.")
@@ -1131,6 +1183,10 @@ Paths always start with the folder name, e.g. 'Notes/Insurance.md'. Changes sync
 so change only what was asked. Prefer edit_text/append_text over rewriting whole notes. Nothing can be deleted or moved,
 and the bridge keeps the previous version of anything it changes. It won't write programs, scripts or shortcuts.
 For big or binary files (docx, xlsx, zip...), use create_download_link and fetch the URL from your own workspace.
+Secret files (tokens, API keys, passwords) have '.secret' in their name and are marked {SECRET_TAG} in listings. No tool
+reads, searches, edits or attaches them: fetch one with create_download_link straight into a private file in your
+workspace and have your script read it from there. Never print it or put it in a chat, note, memory, code, commit or
+command line, and if the link fails, don't look for another way to read it.
 The bridge starts the apps that sync these folders, and Chrome, by itself when they're needed.
 Chrome on this PC: the browser tools here (tabs_context_mcp, navigate, computer, read_page, find, get_page_text...) are
 Claude in Chrome, run through Claude Code on the PC, so they work from any chat. Start with
@@ -1160,6 +1216,10 @@ RO = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hin
 WR = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
 
+def _tag(name: str, real: Path) -> str:
+    return f"  {SECRET_TAG}" if is_secret(name, real) else ""
+
+
 @mcp.tool(annotations=RO)
 def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) -> str:
     """List a folder. With no path, lists the shared folders. recursive=True lists files in subfolders too."""
@@ -1177,13 +1237,13 @@ def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) ->
     root, real, disp = resolve(path)
     if real.is_file():
         st = real.stat()
-        return f"{disp}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}"
+        return f"{disp}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}{_tag(disp, real)}"
     max_entries = max(1, min(max_entries, 5000))
     out, n = [], 0
     if recursive:
-        for full, _ in walk(root, real):
+        for full, rel in walk(root, real):
             st = full.stat()
-            out.append(f"{vname(root, full)}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}")
+            out.append(f"{vname(root, full)}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}{_tag(rel, full)}")
             n += 1
             if n >= max_entries:
                 out.append(f"... stopped at {max_entries} entries")
@@ -1200,7 +1260,7 @@ def list_dir(path: str = "", recursive: bool = False, max_entries: int = 300) ->
                 out.append(f"[dir]  {child.name}/")
             else:
                 st = child.stat()
-                out.append(f"       {child.name}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}")
+                out.append(f"       {child.name}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}{_tag(child.name, child)}")
             n += 1
             if n >= max_entries:
                 out.append(f"... stopped at {max_entries} entries")
@@ -1225,7 +1285,7 @@ def find_files(pattern: str, path: str = "", max_results: int = 200) -> str:
             name = full.name.lower()
             if (fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel.lower(), pat)) if is_glob else (pat in rel.lower()):
                 st = full.stat()
-                out.append(f"{root.name}/{rel}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}")
+                out.append(f"{root.name}/{rel}  {fmt_size(st.st_size)}  {fmt_time(st.st_mtime)}{_tag(rel, full)}")
                 if len(out) >= max_results:
                     return "\n".join(out) + f"\n... stopped at {max_results} results"
             if scanned >= LIMITS["max_search_files"]:
@@ -1237,13 +1297,18 @@ def find_files(pattern: str, path: str = "", max_results: int = 200) -> str:
 def search_text(query: str, path: str = "", regex: bool = False, file_glob: str = "*",
                 max_results: int = 100, context_lines: int = 0) -> str:
     """Search inside text files (md, txt, csv, json...) for a phrase (case-insensitive) or regex.
-    Use path to limit to one folder and file_glob (e.g. '*.md') to filter files."""
+    Use path to limit to one folder and file_glob (e.g. '*.md') to filter files. Secret files are never searched."""
     audit("search_text", query=query, path=path, regex=regex, file_glob=file_glob)
     try:
         rx = re.compile(query if regex else re.escape(query), re.IGNORECASE)
     except re.error as e:
         raise BridgeError(f"Bad regex: {e}")
-    targets = [resolve(path)[:2]] if path.strip("/ ") else [(r, r.path) for r in ROOTS.values() if r.path.exists()]
+    if path.strip("/ "):
+        root, real, disp = resolve(path)
+        refuse_secret(real, disp, "search it")
+        targets = [(root, real)]
+    else:
+        targets = [(r, r.path) for r in ROOTS.values() if r.path.exists()]
     for r, _ in targets:
         sync_first(r)
     out, scanned, hits = [], 0, 0
@@ -1253,6 +1318,8 @@ def search_text(query: str, path: str = "", regex: bool = False, file_glob: str 
         for full, rel in files:
             if full.suffix.lower() not in TEXT_EXTS or not fnmatch.fnmatch(full.name.lower(), file_glob.lower()):
                 continue
+            if is_secret(rel, full):
+                continue  # not even "it matched": that alone would leak something about the contents
             scanned += 1
             if scanned > LIMITS["max_search_files"]:
                 out.append(f"... stopped after scanning {scanned - 1} files")
@@ -1281,11 +1348,13 @@ def search_text(query: str, path: str = "", regex: bool = False, file_glob: str 
 
 @mcp.tool(annotations=RO)
 def read_text(path: str, start_line: int = 1, max_lines: int = 500) -> str:
-    """Read a text file (notes, csv, json...). Use start_line/max_lines to page through long files."""
+    """Read a text file (notes, csv, json...). Use start_line/max_lines to page through long files.
+    Secret files ('.secret' in the name) are refused: use create_download_link for those."""
     audit("read_text", path=path, start_line=start_line)
     root, real, disp = resolve(path)
     if not real.is_file():
         raise BridgeError(f"{disp} is a folder; use list_dir")
+    refuse_secret(real, disp, "read it")
     if real.stat().st_size > LIMITS["max_text_bytes"]:
         raise BridgeError("File too large to read as text; use create_download_link")
     raw = real.read_bytes()
@@ -1308,6 +1377,7 @@ def read_pdf(path: str, start_page: int = 1, end_page: int = 0) -> str:
     import pymupdf
 
     root, real, disp = resolve(path)
+    refuse_secret(real, disp, "read it")
     with pymupdf.open(real) as doc:
         n = doc.page_count
         a = max(1, start_page)
@@ -1329,6 +1399,7 @@ def view_file(path: str, page: int = 1, dpi: int = 110) -> Image:
     """Look at an image, or at one page of a PDF rendered as an image (for scans, forms, receipts)."""
     audit("view_file", path=path, page=page)
     root, real, disp = resolve(path)
+    refuse_secret(real, disp, "show it")
     ext = real.suffix.lower()
     if ext == ".pdf":
         import pymupdf
@@ -1352,13 +1423,19 @@ def view_file(path: str, page: int = 1, dpi: int = 110) -> Image:
 
 @mcp.tool(annotations=RO)
 def create_download_link(path: str, minutes: int = 15) -> str:
-    """Make a short-lived HTTPS link to download one file (any type, any size), e.g. to process it in your own workspace."""
+    """Make a short-lived HTTPS link to download one file (any type, any size), e.g. to process it in your own workspace.
+    This is the only way to use a secret file ('.secret' in the name): its link works once, for a few minutes.
+    Save it straight to a private file and never print it."""
     audit("create_download_link", path=path, minutes=minutes)
     root, real, disp = resolve(path)
     if not real.is_file():
         raise BridgeError("Links are for files, not folders")
-    url = _new_link("download", real, disp, minutes)
-    return f"{url}\nFile: {disp} ({fmt_size(real.stat().st_size)}). Valid for {min(max(1, minutes), 120)} minutes."
+    secret = is_secret(disp, real)
+    url = _new_link("download", real, disp, minutes, once=secret)
+    if secret:
+        return (f"{url}\nSecret file: {disp}. This link works once, for {link_minutes(minutes, True)} minutes. "
+                + SECRET_HOW_TO_USE)
+    return f"{url}\nFile: {disp} ({fmt_size(real.stat().st_size)}). Valid for {link_minutes(minutes)} minutes."
 
 
 @mcp.tool(annotations=WR)
@@ -1367,6 +1444,7 @@ def write_text(path: str, content: str, overwrite: bool = False) -> str:
     to change part of an existing file prefer edit_text or append_text."""
     audit("write_text", path=path, overwrite=overwrite, chars=len(content))
     root, real, disp = resolve(path, want_write=True, must_exist=False)
+    refuse_secret(real, disp, "write it with write_text", write=True)
     if real.exists() and (real.is_dir() or not overwrite):
         raise BridgeError(f"{disp} already exists (use edit_text/append_text, or overwrite=True to replace it)")
     crlf = bom = False
@@ -1386,6 +1464,8 @@ def edit_text(path: str, old_text: str, new_text: str, replace_all: bool = False
     root, real, disp = resolve(path, want_write=True)
     if not real.is_file():
         raise BridgeError(f"{disp} is not a file")
+    # before looking inside: "old_text wasn't found" would tell Claude something about the contents
+    refuse_secret(real, disp, "edit it", write=True)
     text, crlf, bom = read_for_edit(real)
     old = old_text.replace("\r\n", "\n")
     if not old:
@@ -1407,6 +1487,7 @@ def append_text(path: str, text: str, create: bool = True) -> str:
     root, real, disp = resolve(path, want_write=True, must_exist=False)
     if real.is_dir():
         raise BridgeError(f"{disp} is a folder")
+    refuse_secret(real, disp, "add to it", write=True)
     if real.exists():
         current, crlf, bom = read_for_edit(real)
         note = keep_history(root, real)
@@ -1428,8 +1509,10 @@ def create_upload_link(path: str, overwrite: bool = False, minutes: int = 15) ->
     if real.exists() and (real.is_dir() or not overwrite):
         raise BridgeError(f"{disp} already exists (pass overwrite=True to replace a file)")
     url = _new_link("upload", real, disp, minutes, overwrite, root)
-    return (f"{url}\nPUT the file body to this URL (curl -T file URL). One use, valid {min(max(1, minutes), 120)} minutes, "
-            f"max {LIMITS['max_upload_mb']} MB." + ensure_for(root))
+    note = (" Secret file: upload it from a private file in your workspace (curl -sS -T ~/secret/NAME URL), never from "
+            "text you typed, and don't print it." if is_secret(disp, real) else "")
+    return (f"{url}\nPUT the file body to this URL (curl -T file URL). One use, valid {link_minutes(minutes)} minutes, "
+            f"max {LIMITS['max_upload_mb']} MB.{note}" + ensure_for(root))
 
 
 @mcp.tool(annotations=WR)
@@ -1547,7 +1630,9 @@ async def download(request: Request):
     info = LINKS.get(request.path_params["token"])
     if not info or info["kind"] != "download" or info["expires"] < time.time() or not info["path"].is_file():
         return Response(status_code=404)  # TokenGate checks links first; this is a second line
-    log.info("download %s", info["display"])
+    if info.get("once") and request.method == "GET":
+        LINKS.pop(request.path_params["token"], None)  # secret files: one use, so a link left in a chat is useless
+    log.info("download %s%s", info["display"], " (secret, link used up)" if info.get("once") else "")
     return FileResponse(info["path"], filename=info["path"].name,
                         media_type=mimetypes.guess_type(info["path"].name)[0] or "application/octet-stream")
 
