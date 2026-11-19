@@ -2,7 +2,7 @@
 
 This folder is Claude Bridge, an MCP server (Python, `server.py`) that the user (Raph) adds to Claude as a
 custom connector, so Claude can reach two folders on this Windows PC from his phone: **Files** (his documents)
-and **Notes** (Markdown notes). It also passes through Claude in Chrome. Raph runs it on two PCs (a laptop and a
+and **Notes** (Markdown notes), plus his Google Tasks. Raph runs it on two PCs (a laptop and a
 home desktop) that share the same synced folders. It's published via **Tailscale Funnel** and protected by a bearer token. See
 README.md for the design.
 
@@ -55,23 +55,16 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   no writing programs/scripts/shortcuts (`DENY_WRITE_EXTS`), uploads get Mark-of-the-Web, wrong-token lockout
   (`Guard`). Don't add a shell, a move tool or a recursive delete. Never let attacker-controlled text (headers, paths) reach a
   command line: `send_alert` passes the toast XML via an environment variable for that reason.
-- Chrome tools are passed through from Claude Code's `claude --claude-in-chrome-mcp` (see `ChromeLink` in `server.py`).
-  `file_upload` is the bridge's own (`FILE_UPLOAD_TOOL`): it takes Files/Notes paths, checks them with `resolve` and
-  passes the contents (Claude Code's version only accepts contents); keep it that way, including inside
-  `browser_batch`, and never accept absolute paths. Don't log the text Claude types or file contents. `chrome_status`
-  shows the link state; the child's stderr goes to `logs\chrome-mcp.log`. The bridge finds Claude Code by itself
-  (including the desktop app's bundled copy, whose versioned folder changes on app updates). The browser choice is
-  self-healed in `ChromeLink._settle`: it never auto-picks a browser that isn't known to be on this PC.
+- There are no browser tools: Chrome passthrough (Claude in Chrome via Claude Code, `chrome_status`, `file_upload`) was
+  removed in 1.14.0 at Raph's request because it hung. Don't add it back unless he asks.
 - Both folders are always writable (there is no read-only mode), and the config only holds each folder's name and
   path: `_detect_apps` works out the sync app from markers in the folder (`.obsidian`; `.megaignore`/`.debris`) and
-  finds MEGA, Obsidian and Chrome on the PC. Don't reintroduce per-folder app settings.
+  finds MEGA and Obsidian on the PC. Don't reintroduce per-folder app settings.
 - The server must not do anything by itself while unused: no timers or watchers. Sync apps (MEGA/Obsidian) are
   started when a file tool touches their folder (`sync_first` via `resolve`, which then waits for them to catch up:
-  MEGA via its Explorer overlay status in a subprocess, Obsidian by vault quiescence), Chrome when a
-  Chrome tool needs it (`ChromeLink._start_chrome`), history is pruned from `keep_history`, and the Chrome child starts
-  on the first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
-- The tool set is deliberate (README "Tools"): don't add app-control or browser-picking tools back. Unwanted Claude in
-  Chrome tools go in `CHROME_BLOCKED`, which also covers `browser_batch`.
+  MEGA via its Explorer overlay status in a subprocess, Obsidian by vault quiescence), and history is pruned from
+  `keep_history`. The daily update is a separate scheduled task.
+- The tool set is deliberate (README "Tools"): don't add app-control or browser tools back.
 - Google Tasks tools are the bridge's own (the "Google Tasks" section of server.py): plain HTTPS to Google's fixed
   addresses with urllib, no extra packages, no listener or browser on the PC, so they work unchanged on a headless
   Linux box. The OAuth client and refresh token live only in the secret file `google_tasks.secret_file`; never return,

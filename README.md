@@ -5,7 +5,7 @@ Lets Claude, from any device (phone included), reach two folders on your Windows
 - **Files**: your documents (papers, scans, letters, office files...)
 - **Notes**: your Markdown notes
 
-It can also use **Chrome on the PC** and your **Google Tasks**. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
+It can also reach your **Google Tasks**. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
 
 ## Install
 
@@ -35,7 +35,7 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 ## Tools
 
-36 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
+21 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or your tasks.
 
 | Tool | What it does | Suggested |
 |---|---|---|
@@ -53,25 +53,11 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 | `delete_files` | delete files or empty folders, when you asked or agreed (each is kept in history first) | Ask |
 | `restore_file` | list the copies history kept of a file, or put one back | Ask |
 | `create_upload_link` | one-time link to put a file from Claude's workspace onto the PC | Ask |
-| `chrome_status` | Chrome link status; picks the browser if the bridge can't tell | Allow |
 | `update_bridge` | check for a new version, or install it | Ask |
-| `tabs_context_mcp` | list Claude's tabs (can open its own tab group) | Allow |
-| `tabs_create_mcp` / `tabs_close_mcp` | open / close a tab in Claude's tab group | Allow |
-| `read_page` / `find` / `get_page_text` | read the page | Allow |
-| `read_console_messages` / `read_network_requests` | page console and network log | Allow |
-| `navigate` | go to a URL | Ask |
-| `computer` | click, type, scroll, take screenshots | Ask |
-| `form_input` | fill in form fields | Ask |
-| `javascript_tool` | run JavaScript in the page | Ask |
-| `browser_batch` | several of the above in one go | Ask |
-
-| `file_upload` | attach files from Files or Notes to a page, e.g. email attachments (up to 10 MB in one go) | Ask |
 | `connect_google_tasks` | sign in to Google Tasks, check the sign-in, or sign out | Ask |
 | `list_task_lists` / `list_tasks` | your Google Tasks lists and tasks | Allow |
 | `add_task` / `update_task` | add a task; change, tick off or reopen one | Ask |
 | `delete_task` | delete a task, when you asked or agreed | Ask |
-
-Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_browsers`, `select_browser` and `switch_browser`. The bridge picks the browser itself.
 
 ## What keeps it safe
 
@@ -81,14 +67,12 @@ Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_bro
 - **Every change and deletion can be undone:** before a file is changed or deleted, the bridge keeps it in `%LOCALAPPDATA%\ClaudeBridge\history` for 30 days, and `restore_file` puts it back. `delete_files` is only for files you asked for or agreed to, or redundant files Claude made itself. It never deletes through links or deletes a folder with anything left in it, and the Claude app asks you before each call (it's marked destructive). Nothing is moved.
 - **No programs:** the bridge never writes programs, scripts, shortcuts or installers (`.exe`, `.bat`, `.ps1`, `.js`, `.lnk`, `.url`...). Uploaded files get the same "downloaded from the internet" mark a browser adds, so Office and SmartScreen stay cautious.
 - **Hidden:** `.obsidian` (plugin code and settings), `.git`, `.ssh`, password databases and key files.
-- **Secret files are link-only:** a file with `.secret` in its name (`synci-token.secret.txt`, `api.secret`) is for tokens, API keys and passwords that Claude's scripts need. It's listed, marked `[secret: link only]`, and Claude can fetch it with a download link, which then works once, for at most 5 minutes, or replace it with an upload link. The bytes go straight between the PC and a file in Claude's workspace. No tool reads, searches, edits or attaches it to a web page, so its contents can't end up in a chat, even by a fallback or a mistake. Every refusal tells Claude the right way to use it instead: save it to a private file, let the script read it from there, never print it. Change the pattern with `secret_files` in `config.json`.
-- **Chrome:** everything happens inside Chrome, under the Claude in Chrome extension's own site permissions.
+- **Secret files are link-only:** a file with `.secret` in its name (`synci-token.secret.txt`, `api.secret`) is for tokens, API keys and passwords that Claude's scripts need. It's listed, marked `[secret: link only]`, and Claude can fetch it with a download link, which then works once, for at most 5 minutes, or replace it with an upload link. The bytes go straight between the PC and a file in Claude's workspace. No tool reads, searches or edits it, so its contents can't end up in a chat, even by a fallback or a mistake. Every refusal tells Claude the right way to use it instead: save it to a private file, let the script read it from there, never print it. Change the pattern with `secret_files` in `config.json`.
 - **Google Tasks:** your own Google OAuth client, signed in to the Tasks permission only. The client and the sign-in live in one secret file in Files, so no tool can show them, and access tokens stay in memory. The bridge only calls Google's own fixed addresses, and never logs task titles or notes.
-- **Uploads to websites only from Files and Notes:** `file_upload` takes bridge paths, which are checked like any other file tool, so hidden folders, keys and password files are excluded. The bridge then hands Chrome the files' contents. Claude Code itself can't read files on the PC, so nothing else can be uploaded.
 - **Updates come only from this repo's releases,** checked against their SHA-256. An update never turns a switched-off bridge back on.
 - **Everything is logged** in `logs\bridge.log`, without the text Claude types or writes.
 
-What remains: anyone with the token can do what Claude can. That includes acting in Chrome with your signed-in accounts, so treat the token like a password. Anyone who can publish a release here (your GitHub account) can update the code on your PC, so keep 2FA on.
+What remains: anyone with the token can do what Claude can, so treat the token like a password. Anyone who can publish a release here (your GitHub account) can update the code on your PC, so keep 2FA on.
 
 ## Blocking, lockout and alerts
 
@@ -128,20 +112,6 @@ tailscale serve status --json
 Separately, devices on your **tailnet** (not the internet) can reach the PC like a local network, under your Tailscale access rules. `bridge.cmd off` removes the Funnel.
 
 **Dependencies:** they're pinned in `uv.lock`. Every release, and a weekly job, check them against public vulnerability advisories. A failed weekly run means GitHub emails you; then update the lock and release.
-
-## Chrome on the PC
-
-The bridge runs the Claude in Chrome server that comes with **Claude Code**, and passes its browser tools through. So any chat with the connector can use Chrome here, including one on your phone, without the Claude desktop app.
-
-- **Claude Code:** found automatically: a standalone install, or the copy inside the Claude desktop app, which it follows across app updates.
-- **Sign in once:** in PowerShell from the Start menu, run that `claude.exe` and type `/login`, using the same account as the Chrome extension. For the app's copy, the path is `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<version>\<build>\claude.exe`.
-- **On demand:** on the first Chrome call, the bridge starts Chrome if it isn't running, then the Chrome server (a few seconds). It stops the server after 10 minutes without a Chrome call.
-- **Which browser:** the one in use, or the one used last here, or the one Claude Code knows is on this PC. It never picks a browser on another computer by itself. If it can't tell, Claude asks you and calls `chrome_status(browser=...)`, and your answer is remembered.
-- **Site permissions:** the extension's own settings apply. If a site isn't allowed, the extension asks in Chrome on the PC, so allow the sites you use in the extension beforehand.
-
-**Settings** (under `"chrome"`): `enabled`, `idle_minutes`, `profile` (a Chrome profile folder such as `"Profile 1"`, if Claude in Chrome is not in the default one), `device_id`, `permission_mode`, `call_timeout_seconds`, `claude_path`.
-
-If something's wrong, ask Claude to run `chrome_status`, or look at `logs\chrome-mcp.log`.
 
 ## Google Tasks
 
@@ -206,7 +176,7 @@ From your phone, you can also cut it off by disabling this machine in the Tailsc
 
 - **Sync apps:** the bridge works out by itself which app syncs each folder: Obsidian if the folder is in a vault (`.obsidian`), MEGA if it's in a MEGA sync (`.megaignore` or `.debris`). It starts that app whenever Claude reads or changes something there, so reads are up to date and changes upload. If it had to start it, the file operation waits until the app has caught up, for at most 45 seconds:
   - **MEGA:** until MEGA reports the folder as synced (the same status as its Explorer icons).
-  - **Obsidian:** until the vault is open and its files have stopped changing for a few seconds. Chrome is started whenever a Chrome tool needs it. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
+  - **Obsidian:** until the vault is open and its files have stopped changing for a few seconds. They're left alone otherwise. `list_dir` with no path, and `bridge.cmd status`, show what was found.
 - **Restoring a file:** ask Claude (`restore_file`), or copy it back yourself from `history\<Files|Notes>\...\<file>.<date-time>` (deleted files end in `.deleted`). After 30 days, your sync app's version history or Rubbish bin may still have it.
 - **Keeping it reachable:**
   - **Sleep:** set sleep to Never when plugged in, and closing the lid to "Do nothing".
