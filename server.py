@@ -1810,9 +1810,12 @@ def _gt_setup(disp: str) -> str:
     return (
         "Google Tasks isn't set up yet. Raph needs his own Google OAuth client once (about 10 minutes, on any device, at "
         "console.cloud.google.com): 1) create a project; 2) APIs & Services > Library: enable 'Google Tasks API'; "
-        "3) Google Auth Platform: get started as an External app (his own email as support and contact address), then "
+        "3) Google Auth Platform: get started as an External app (his own email as support and contact address); on "
+        "Branding, set the home page to https://github.com/raphlau/ClaudeBridge, the privacy policy to "
+        "https://github.com/raphlau/ClaudeBridge/blob/main/PRIVACY.md and add github.com as an authorized domain; then "
         "Audience > Publish app, so it says 'In production' (while it's in Testing, Google ends the sign-in every 7 days; "
-        "no verification is needed for his own use); 4) Clients > Create client > 'Desktop app', then download its JSON; "
+        "no verification is needed for his own use, so close any prompt to submit for it); 4) Clients > Create client > "
+        "'Desktop app', then download its JSON straight away (Google shows the secret only once); "
         f"5) save that file as {disp} (the name must keep '.secret', so no tool can read it). "
         "Then call connect_google_tasks() again.")
 

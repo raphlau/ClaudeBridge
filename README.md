@@ -154,9 +154,13 @@ extra to install, and no browser or screen needed on the PC.
 1. Create a project.
 2. **APIs & Services > Library:** enable **Google Tasks API**.
 3. **Google Auth Platform:** get started as an **External** app, with your own email as the support and contact address.
-   Then **Audience > Publish app**, so it says **In production**. While it says Testing, Google ends the sign-in after
-   7 days. No verification is needed for your own use.
-4. **Clients > Create client > Desktop app**, then download its JSON.
+   Google won't publish an app without a home page and a privacy policy, so on **Branding** set the home page to
+   `https://github.com/raphlau/ClaudeBridge`, the privacy policy to
+   `https://github.com/raphlau/ClaudeBridge/blob/main/PRIVACY.md`, and add `github.com` under **Authorized domains**.
+   Don't upload a logo (it starts a brand verification). Then **Audience > Publish app**, so it says **In production**.
+   While it says Testing, Google ends the sign-in after 7 days. No verification is needed for your own use, so close any
+   prompt to submit for it.
+4. **Clients > Create client > Desktop app**, then download its JSON straight away: Google shows the secret only once.
 5. Save that file as `Files/Claude/google-tasks.secret.json` (keep `.secret` in the name).
 
 **Sign in:** ask Claude to connect Google Tasks. It sends you a Google link. Open it on any device, allow access to your
