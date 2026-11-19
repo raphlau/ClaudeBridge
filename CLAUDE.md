@@ -72,6 +72,11 @@ built-in workflow token. Never commit config.json, connector.txt, logs or anythi
   on the first Chrome call and stops after `chrome.idle_minutes`. The daily update is a separate scheduled task.
 - The tool set is deliberate (README "Tools"): don't add app-control or browser-picking tools back. Unwanted Claude in
   Chrome tools go in `CHROME_BLOCKED`, which also covers `browser_batch`.
+- Google Tasks tools are the bridge's own (the "Google Tasks" section of server.py): plain HTTPS to Google's fixed
+  addresses with urllib, no extra packages, no listener or browser on the PC, so they work unchanged on a headless
+  Linux box. The OAuth client and refresh token live only in the secret file `google_tasks.secret_file`; never return,
+  log or print anything from it, and keep access tokens in memory. Sign-in is PKCE with a loopback redirect nothing
+  listens on: Raph pastes the address back into the chat. Don't log task titles or notes.
 - Only the Files and Notes folders are shared. Don't add migration code for old configs: both PCs are current, and
   config clean-ups are done by hand.
 - update.ps1 must stay a no-op while the bridge is switched off (`bridge.cmd off` is the kill switch), and must

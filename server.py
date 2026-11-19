@@ -11,7 +11,9 @@ change and deletion is kept in the bridge's history first, so it can be undone; 
 from __future__ import annotations
 
 import asyncio
+import base64
 import fnmatch
+import hashlib
 import hmac
 import io
 import json
@@ -25,8 +27,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -41,7 +46,7 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CLAUDE_BRIDGE_CONFIG", BASE_DIR / "config.json"))
 IS_WINDOWS = sys.platform == "win32"
@@ -97,6 +102,9 @@ DENY_WRITE_EXTS = {s.lower() for s in CFG.get("deny_write_exts", [
     ".searchconnector-ms", ".appref-ms", ".application", ".appx", ".msix", ".msixbundle", ".appinstaller",
     ".settingcontent-ms", ".chm", ".xll", ".iqy", ".slk", ".gadget"])}
 DENY_WRITE_NAMES = {"desktop.ini", "autorun.inf"}
+# Google Tasks (see "Google Tasks" below). The sign-in lives in this secret file in the shared folders, so every PC that
+# syncs it is signed in.
+GTASKS = {"enabled": True, "secret_file": "Files/Claude/google-tasks.secret.json", **(CFG.get("google_tasks") or {})}
 WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$", re.IGNORECASE)
 
 LOG_DIR = Path(CFG.get("log_dir") or BASE_DIR / "logs")
@@ -1219,7 +1227,10 @@ tabs_context_mcp(createIfEmpty=true) and work in your own tab. The bridge starts
 itself; if it says it can't tell which browser is the PC's, ask Raph, then call chrome_status(browser=...).
 chrome_status also shows what's wrong when Chrome calls fail. To attach files to a page (e.g. email attachments), use
 file_upload with paths in Files or Notes; nothing else on the PC can be uploaded.
-update_bridge checks for a newer version of the bridge and can install it; it also updates itself once a day."""
+update_bridge checks for a newer version of the bridge and can install it; it also updates itself once a day.""" + ("""
+Google Tasks (the tasks Raph adds in Google Calendar or the Tasks app): list_task_lists, list_tasks, add_task, update_task
+and delete_task. If they say Google Tasks isn't connected, follow what connect_google_tasks says. Due dates are dates
+only: Google's API drops any time of day, so put a time in the notes if it matters.""" if GTASKS.get("enabled", True) else "")
 
 
 class BridgeServer(MCPServer):
@@ -1734,6 +1745,518 @@ async def update_bridge(install: bool = False, reinstall: bool = False) -> str:
                           "Raph needs to run the installer on the PC once to set it up.")
     return (f"{'Reinstalling' if not newer else 'Updating to'} {latest}. The bridge restarts in about a minute, so this "
             "connection will drop; then call update_bridge() to see the result.")
+
+
+# ---------------------------------------------------------------- Google Tasks
+#
+# Raph's Google Tasks (the tasks Google Calendar shows), through Google's Tasks REST API with his own OAuth client.
+# Plain HTTPS from this process: no extra packages, and nothing needs a browser, a listener or a screen on this machine,
+# so it works the same on a headless box. The OAuth client (a "Desktop app" client downloaded from Google Cloud) and
+# the refresh token live together in one secret file in the shared folders (GTASKS["secret_file"]): no tool returns its
+# contents, and every PC that syncs it is signed in.
+# Signing in: connect_google_tasks makes a Google sign-in link (PKCE, with a loopback redirect to 127.0.0.1 that nothing
+# listens on). Raph approves on any device; his browser then fails to load 127.0.0.1 and he pastes that address into the
+# chat. The code in it is single-use and useless without the PKCE verifier, which never leaves this process.
+# Only Google's own fixed addresses are ever called; access tokens stay in memory.
+
+GT_SCOPE = "https://www.googleapis.com/auth/tasks"
+GT_API = "https://tasks.googleapis.com/tasks/v1"
+GT_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GT_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GT_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+GT_REDIRECT = "http://127.0.0.1:8766"  # loopback redirects are allowed for Desktop app clients, on any port
+GT_SIGNIN_MINUTES = 15
+GT_MAX_TASKS = 500
+GT_LOCK = threading.Lock()
+_gt_pending: dict[str, Any] = {}  # the sign-in link in progress: state, PKCE verifier, expiry
+_gt_access: dict[str, Any] = {}   # the current access token and its expiry (memory only)
+GRO = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
+GWR = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True)
+GDEL = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
+
+
+class GoogleHTTPError(Exception):
+    """An error answer from Google. Kept apart from BridgeError so its details are turned into a message on purpose."""
+
+    def __init__(self, status: int, info: Any):
+        super().__init__(status)
+        self.status = status
+        self.info = info if isinstance(info, dict) else {}
+
+    @property
+    def code(self) -> str:
+        """The token endpoint's 'error' string (invalid_grant...), or the API error's status or first reason."""
+        err = self.info.get("error")
+        if isinstance(err, str):
+            return err
+        if isinstance(err, dict):
+            reasons = [e.get("reason", "") for e in err.get("errors") or [] if isinstance(e, dict)]
+            details = [d.get("reason", "") for d in err.get("details") or [] if isinstance(d, dict)]
+            return next((r for r in reasons + details if r), "") or str(err.get("status", ""))
+        return ""
+
+    @property
+    def message(self) -> str:
+        err = self.info.get("error")
+        text = err.get("message", "") if isinstance(err, dict) else self.info.get("error_description", "")
+        return str(text)[:300]
+
+
+class GoogleSignInGone(BridgeError):
+    """The saved sign-in no longer works (expired or revoked)."""
+
+
+def _gt_setup(disp: str) -> str:
+    return (
+        "Google Tasks isn't set up yet. Raph needs his own Google OAuth client once (about 10 minutes, on any device, at "
+        "console.cloud.google.com): 1) create a project; 2) APIs & Services > Library: enable 'Google Tasks API'; "
+        "3) Google Auth Platform: get started as an External app (his own email as support and contact address), then "
+        "Audience > Publish app, so it says 'In production' (while it's in Testing, Google ends the sign-in every 7 days; "
+        "no verification is needed for his own use); 4) Clients > Create client > 'Desktop app', then download its JSON; "
+        f"5) save that file as {disp} (the name must keep '.secret', so no tool can read it). "
+        "Then call connect_google_tasks() again.")
+
+
+def _gt_file() -> tuple[Root, Path, str]:
+    root, real, disp = resolve(GTASKS["secret_file"], want_write=True, must_exist=False)
+    if not is_secret(disp, real):
+        raise BridgeError(f"google_tasks.secret_file in config.json ({disp}) must have '.secret' in its name, so no tool "
+                          "can read the sign-in it holds")
+    return root, real, disp
+
+
+def _gt_load() -> tuple[dict[str, Any], dict[str, Any], str]:
+    """(the whole secret file, its OAuth client, its display path), or raise with what to do. Never shows contents."""
+    _, real, disp = _gt_file()
+    if not real.is_file():
+        raise BridgeError(_gt_setup(disp))
+    try:
+        data = json.loads(real.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        raise BridgeError(f"{disp} isn't the JSON file Google gives for an OAuth client. " + _gt_setup(disp))
+    client = data.get("installed")
+    if not isinstance(client, dict):
+        kind = "a 'Web application'" if "web" in data else "not a 'Desktop app'"
+        raise BridgeError(f"{disp} holds {kind} OAuth client. In Google Cloud, create a client of type 'Desktop app', "
+                          f"download its JSON and save it as {disp}.")
+    if not client.get("client_id") or not client.get("client_secret"):
+        raise BridgeError(f"{disp} has no client ID or secret: download the client's JSON again from Google Cloud "
+                          f"(Clients > the Desktop app client > Download JSON) and save it as {disp}.")
+    return data, client, disp
+
+
+def _gt_save(data: dict[str, Any]) -> str:
+    root, real, _ = _gt_file()
+    keep_history(root, real)
+    write_atomic(real, json.dumps(data, indent=2) + "\n")
+    return ensure_for(root)
+
+
+def _gt_http(method: str, url: str, *, body: Any = None, form: dict[str, str] | None = None, token: str = "") -> Any:
+    headers = {"User-Agent": f"ClaudeBridge/{VERSION}", "Accept": "application/json"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            info = json.loads(e.read() or b"{}")
+        except ValueError:
+            info = {}
+        raise GoogleHTTPError(e.code, info) from None
+    except (urllib.error.URLError, OSError) as e:  # offline, DNS, timeout
+        raise BridgeError(f"Couldn't reach Google ({_err(e)}). Is this PC online?") from None
+    try:
+        return json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        raise BridgeError("Google sent an answer the bridge couldn't read; try again") from None
+
+
+def _gt_token(force: bool = False) -> str:
+    """A current access token, refreshed from the saved sign-in when needed."""
+    with GT_LOCK:
+        if not force and _gt_access.get("token") and _gt_access.get("expires", 0) > time.time() + 60:
+            return _gt_access["token"]
+        _gt_access.clear()
+        data, client, disp = _gt_load()
+        refresh = data.get("refresh_token")
+        if not refresh:
+            raise BridgeError("Google Tasks isn't signed in yet: call connect_google_tasks() and follow what it says.")
+        try:
+            res = _gt_http("POST", GT_TOKEN_URL, form={
+                "client_id": client["client_id"], "client_secret": client["client_secret"],
+                "refresh_token": refresh, "grant_type": "refresh_token"})
+        except GoogleHTTPError as e:
+            if e.code == "invalid_grant":
+                raise GoogleSignInGone(
+                    "Google refused the saved sign-in (it expired or was revoked). If the app is still in 'Testing' "
+                    "(Google Cloud > Google Auth Platform > Audience), Google ends sign-ins after 7 days: Raph should "
+                    "click 'Publish app' first. Then call connect_google_tasks(reconnect=True).") from None
+            if e.code in ("invalid_client", "unauthorized_client", "deleted_client"):
+                raise BridgeError(f"Google doesn't accept the OAuth client in {disp} any more (deleted, or its secret "
+                                  "changed): download its JSON again, save it over that file, then call "
+                                  "connect_google_tasks(reconnect=True).") from None
+            raise BridgeError(f"Google sign-in failed ({e.status} {e.code}): {e.message}") from None
+        if not res.get("access_token"):
+            raise BridgeError("Google sent no access token; try again")
+        _gt_access.update(token=res["access_token"], expires=time.time() + int(res.get("expires_in") or 3600))
+        return res["access_token"]
+
+
+def _gt_api(method: str, path: str, *, params: dict[str, Any] | None = None, body: Any = None,
+            missing_ok: bool = False) -> Any:
+    """Call the Tasks API. missing_ok=True returns None instead of raising when Google says there's no such item."""
+    url = GT_API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    for attempt in (0, 1):
+        try:
+            return _gt_http(method, url, body=body, token=_gt_token(force=attempt == 1))
+        except GoogleHTTPError as e:
+            if e.status == 401 and attempt == 0:
+                continue  # the access token went stale early: refresh once
+            if missing_ok and e.status in (400, 404):
+                return None  # Google answers 400 or 404 for an id that isn't in that list
+            low = f"{e.code} {e.message}".lower()
+            if e.status == 403 and ("accessnotconfigured" in low or "service_disabled" in low or "has not been used" in low):
+                raise BridgeError("The Google Tasks API is switched off in Raph's Google Cloud project: he should enable "
+                                  "'Google Tasks API' (APIs & Services > Library), wait a minute, and try again.") from None
+            if e.status == 403 and ("insufficient" in low or "scope" in low):
+                raise BridgeError("The sign-in doesn't include permission to see and edit tasks: call "
+                                  "connect_google_tasks(reconnect=True) and have Raph tick that permission.") from None
+            if e.status == 404:
+                raise BridgeError("Google Tasks has no such task or list (it may have been deleted): list_task_lists "
+                                  "and list_tasks give the current ids.") from None
+            if e.status == 429:
+                raise BridgeError("Google Tasks says too many requests: wait a minute and try again.") from None
+            raise BridgeError(f"Google Tasks said {e.status} {e.code}: {e.message}") from None
+    raise BridgeError("Google Tasks keeps refusing the sign-in: call connect_google_tasks(reconnect=True)")
+
+
+def _q(part: str) -> str:
+    return urllib.parse.quote(part, safe="@")
+
+
+def _gt_lists() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    page = ""
+    while True:
+        res = _gt_api("GET", "/users/@me/lists", params={"maxResults": 100, **({"pageToken": page} if page else {})})
+        out += [x for x in res.get("items") or [] if isinstance(x, dict)]
+        page = res.get("nextPageToken") or ""
+        if not page or len(out) >= 1000:
+            return out
+
+
+def _gt_pick_list(tasklist: str, lists: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A task list by id or (case-insensitive) title; empty or '@default' means his default list ('My Tasks')."""
+    want = (tasklist or "").strip()
+    if not want or want == "@default":
+        return _gt_api("GET", "/users/@me/lists/@default")
+    lists = _gt_lists() if lists is None else lists
+    for tl in lists:
+        if tl.get("id") == want:
+            return tl
+    named = [tl for tl in lists if (tl.get("title") or "").strip().lower() == want.lower()]
+    if len(named) == 1:
+        return named[0]
+    if named:
+        raise BridgeError(f"{len(named)} task lists are called {want!r}; give one by id: "
+                          + ", ".join(tl.get("id", "?") for tl in named))
+    raise BridgeError(f"No task list called {want!r}. His lists: " + ", ".join(repr(tl.get("title", "")) for tl in lists))
+
+
+def _gt_date(day: str, what: str) -> date:
+    try:
+        return date.fromisoformat(day.strip()[:10])
+    except ValueError:
+        raise BridgeError(f"{what} must be a date like 2026-11-20") from None
+
+
+def _gt_due(due: str) -> tuple[str, str]:
+    """'2026-11-20' (or a date and time, whose time Google drops) -> (the API's value, a note for Claude)."""
+    s = due.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", s):
+        raise BridgeError("due must be a date like 2026-11-20")
+    d = _gt_date(s, "due")
+    note = " Google Tasks keeps due dates only, so the time was dropped (put it in the notes if it matters)." \
+        if len(s) > 10 else ""
+    return f"{d.isoformat()}T00:00:00.000Z", note
+
+
+def _gt_lines(tasks: list[dict[str, Any]]) -> list[str]:
+    """Tasks as an indented checklist in Google's order, subtasks under their parent."""
+    ids = {t.get("id") for t in tasks}
+    kids: dict[str, list[dict[str, Any]]] = {}
+    for t in tasks:
+        kids.setdefault(t.get("parent") if t.get("parent") in ids else "", []).append(t)
+    for v in kids.values():
+        v.sort(key=lambda t: t.get("position") or "")
+    out: list[str] = []
+
+    def emit(t: dict[str, Any], depth: int) -> None:
+        pad = "  " * depth
+        done = t.get("status") == "completed"
+        bits = []
+        if t.get("due"):
+            bits.append(f"due {str(t['due'])[:10]}")
+        if done and t.get("completed"):
+            bits.append(f"done {str(t['completed'])[:10]}")
+        if t.get("assignmentInfo"):
+            bits.append("assigned from " + str((t["assignmentInfo"] or {}).get("surfaceType", "another app")).lower())
+        bits.append(f"id: {t.get('id', '?')}")
+        out.append(f"{pad}- [{'x' if done else ' '}] {(t.get('title') or '(no title)').strip()}  ({', '.join(bits)})")
+        notes = " / ".join(line.strip() for line in (t.get("notes") or "").splitlines() if line.strip())
+        if notes:
+            out.append(f"{pad}    notes: {notes[:300]}{'...' if len(notes) > 300 else ''}")
+        for c in kids.get(t.get("id") or "", []):
+            if depth < 5:
+                emit(c, depth + 1)
+
+    for t in kids.get("", []):
+        emit(t, 0)
+    return out
+
+
+def _gt_find(task_id: str, tasklist: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(the list, the task) for a task id, looking in every list when tasklist is empty."""
+    task_id = (task_id or "").strip()
+    if not task_id:
+        raise BridgeError("Give the task's id (list_tasks shows it)")
+    chosen = [_gt_pick_list(tasklist)] if tasklist.strip() else _gt_lists()
+    for tl in chosen:
+        task = _gt_api("GET", f"/lists/{_q(tl['id'])}/tasks/{_q(task_id)}", missing_ok=True)
+        if task and not task.get("deleted"):
+            return tl, task
+    where = f"the list {chosen[0].get('title')!r}" if tasklist.strip() else "any of his lists"
+    raise BridgeError(f"No task with id {task_id!r} in {where} (list_tasks shows the current ids)")
+
+
+def connect_google_tasks(redirect_url: str = "", reconnect: bool = False, disconnect: bool = False) -> str:
+    """Sign the bridge in to Raph's Google Tasks, check the sign-in, or sign out.
+    With no arguments: says whether it's connected, and if not, gives a Google sign-in link to send Raph. He can open it
+    on any device (his phone is fine). After he allows access, his browser shows an error page for 127.0.0.1: that's
+    expected. He copies that page's full address and pastes it in the chat, and you pass it here as redirect_url.
+    reconnect=True starts a new sign-in even if one works; disconnect=True signs out and revokes it at Google."""
+    audit("connect_google_tasks", finishing=bool(redirect_url.strip()), reconnect=reconnect, disconnect=disconnect)
+    data, client, disp = _gt_load()
+    if disconnect:
+        refresh = data.pop("refresh_token", None)
+        for k in ("scope", "connected_at"):
+            data.pop(k, None)
+        with GT_LOCK:
+            _gt_access.clear()
+            _gt_pending.clear()
+        if not refresh:
+            return "Google Tasks wasn't signed in; nothing to do."
+        revoked = "and revoked at Google"
+        try:
+            _gt_http("POST", GT_REVOKE_URL, form={"token": refresh})
+        except (GoogleHTTPError, BridgeError):
+            revoked = "(Google didn't confirm the revoke; Raph can remove access at myaccount.google.com/permissions)"
+        return f"Signed out of Google Tasks {revoked}. The OAuth client stays in {disp}." + _gt_save(data)
+
+    if redirect_url.strip():
+        return _gt_finish(redirect_url.strip(), data, client, disp)
+
+    note = ""
+    if data.get("refresh_token") and not reconnect:
+        try:
+            lists = _gt_lists()
+        except GoogleSignInGone as e:
+            note = str(e) + "\nSo here's a new sign-in link.\n\n"
+        else:
+            since = f" since {data['connected_at']}" if data.get("connected_at") else ""
+            names = ", ".join(tl.get("title") or "(untitled)" for tl in lists) or "none"
+            return f"Google Tasks is connected{since}. Task lists: {names}."
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(24)
+    with GT_LOCK:
+        _gt_pending.clear()
+        _gt_pending.update(state=state, verifier=verifier, client_id=client["client_id"],
+                           expires=time.time() + GT_SIGNIN_MINUTES * 60)
+    url = GT_AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"], "redirect_uri": GT_REDIRECT, "response_type": "code", "scope": GT_SCOPE,
+        "access_type": "offline", "prompt": "consent", "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state})
+    return (note + f"Send Raph this sign-in link (it works once, for {GT_SIGNIN_MINUTES} minutes):\n{url}\n\n"
+            "Tell him: sign in with the Google account whose tasks you want. If Google says the app isn't verified, "
+            "that's your own app: tap Advanced, then 'Go to ...'. Allow access to your tasks. Then the page fails to load "
+            "(127.0.0.1 or localhost): that's expected. Copy the whole address from the address bar and paste it here.\n"
+            "Then call connect_google_tasks(redirect_url=<what he pasted>), through this same connector: the link "
+            "only works with the PC that made it.")
+
+
+def _gt_finish(pasted: str, data: dict[str, Any], client: dict[str, Any], disp: str) -> str:
+    query = pasted.split("?", 1)[1] if "?" in pasted else pasted
+    q = urllib.parse.parse_qs(query.split("#", 1)[0])
+    if "error" in q:
+        why = q["error"][0]
+        hint = " (he didn't allow access)" if why == "access_denied" else ""
+        return f"Google didn't sign him in: {why}{hint}. Call connect_google_tasks() for a new link if he wants to retry."
+    code = (q.get("code") or [""])[0] if "code=" in pasted else pasted
+    state = (q.get("state") or [""])[0]
+    if not code or not re.fullmatch(r"[A-Za-z0-9/_\-.%]+", code):
+        raise BridgeError("That isn't the address Google sent him to: it should start with http://127.0.0.1:8766/ and "
+                          "contain code=... Ask him to copy the whole address from the address bar.")
+    with GT_LOCK:
+        pending = dict(_gt_pending)
+        _gt_pending.clear()  # one go per link: a code only works once anyway
+    if not pending or pending["expires"] < time.time() or pending["client_id"] != client["client_id"]:
+        raise BridgeError("There's no sign-in waiting on this PC (the link expired, the bridge restarted, or another PC "
+                          "made it). Call connect_google_tasks() for a new link.")
+    if "code=" in pasted and not hmac.compare_digest(state.encode(), pending["state"].encode()):
+        raise BridgeError("That address belongs to an older sign-in link. Call connect_google_tasks() for a new link.")
+    try:
+        res = _gt_http("POST", GT_TOKEN_URL, form={
+            "code": urllib.parse.unquote(code), "client_id": client["client_id"], "client_secret": client["client_secret"],
+            "redirect_uri": GT_REDIRECT, "grant_type": "authorization_code", "code_verifier": pending["verifier"]})
+    except GoogleHTTPError as e:
+        if e.code == "invalid_grant":
+            raise BridgeError("Google didn't accept that code (it was already used, or is too old). Call "
+                              "connect_google_tasks() for a new link.") from None
+        raise BridgeError(f"Google sign-in failed ({e.status} {e.code}): {e.message}") from None
+    if GT_SCOPE not in str(res.get("scope", "")).split():
+        raise BridgeError("He signed in but didn't tick the permission to see and edit his tasks. Call "
+                          "connect_google_tasks() for a new link and ask him to tick it.")
+    if not res.get("refresh_token"):
+        raise BridgeError("Google didn't give a lasting sign-in. Call connect_google_tasks() for a new link.")
+    data.update(refresh_token=res["refresh_token"], scope=res.get("scope", GT_SCOPE),
+                connected_at=time.strftime("%Y-%m-%d %H:%M"))
+    synced = _gt_save(data)
+    with GT_LOCK:
+        _gt_access.update(token=res.get("access_token", ""), expires=time.time() + int(res.get("expires_in") or 0))
+    lists = _gt_lists()
+    names = ", ".join(tl.get("title") or "(untitled)" for tl in lists) or "none"
+    return f"Connected to Google Tasks. Task lists: {names}. The sign-in is saved in {disp}." + synced
+
+
+def list_task_lists() -> str:
+    """List Raph's Google Tasks lists (the first is usually his default, 'My Tasks')."""
+    audit("list_task_lists")
+    lists = _gt_lists()
+    if not lists:
+        return "He has no task lists."
+    return "\n".join(f"- {tl.get('title') or '(untitled)'}  (id: {tl.get('id')}, updated {str(tl.get('updated', ''))[:10]})"
+                     for tl in lists)
+
+
+def list_tasks(tasklist: str = "", include_completed: bool = False, due_from: str = "", due_to: str = "",
+               max_results: int = 200) -> str:
+    """List Raph's Google Tasks, subtasks indented under their parent. tasklist: a list's title or id (default: every
+    list). include_completed=True adds done tasks. due_from / due_to (dates like 2026-11-20, inclusive) keep only tasks
+    due in that range, which leaves out tasks with no due date. Each task shows its id, for update_task and delete_task."""
+    audit("list_tasks", tasklist=tasklist, include_completed=include_completed, due_from=due_from, due_to=due_to)
+    lists = _gt_lists()
+    chosen = [_gt_pick_list(tasklist, lists)] if tasklist.strip() else lists
+    params: dict[str, Any] = {"maxResults": 100, "showCompleted": str(include_completed).lower(),
+                              "showHidden": str(include_completed).lower()}
+    # Google stores a due date as that day at 00:00 UTC. These bounds take in the whole first and last day whether
+    # Google treats them as inclusive or not.
+    if due_from.strip():
+        params["dueMin"] = f"{(_gt_date(due_from, 'due_from') - timedelta(days=1)).isoformat()}T23:59:59.999Z"
+    if due_to.strip():
+        params["dueMax"] = f"{_gt_date(due_to, 'due_to').isoformat()}T23:59:59.999Z"
+    limit = max(1, min(int(max_results or 200), GT_MAX_TASKS))
+    out: list[str] = []
+    total = 0
+    for tl in chosen:
+        tasks: list[dict[str, Any]] = []
+        page = ""
+        while total + len(tasks) < limit:
+            res = _gt_api("GET", f"/lists/{_q(tl['id'])}/tasks", params={**params, **({"pageToken": page} if page else {})})
+            tasks += [t for t in res.get("items") or [] if isinstance(t, dict) and not t.get("deleted")]
+            page = res.get("nextPageToken") or ""
+            if not page:
+                break
+        tasks = tasks[:limit - total]
+        total += len(tasks)
+        out.append(f"{tl.get('title') or '(untitled)'} (list id: {tl.get('id')}):")
+        filtered = "dueMin" in params or "dueMax" in params
+        out += _gt_lines(tasks) or ["  (nothing due then)" if filtered else "  (empty)" if include_completed
+                                    else "  (nothing to do)"]
+        if total >= limit:
+            out.append(f"... stopped at {limit} tasks; narrow it with tasklist or due_from/due_to")
+            break
+    return "\n".join(out)
+
+
+def add_task(title: str, tasklist: str = "", notes: str = "", due: str = "", parent_id: str = "") -> str:
+    """Add a task to Raph's Google Tasks. tasklist: a list's title or id (default: his default list, 'My Tasks').
+    due: a date like 2026-11-20 (Google keeps no time of day). parent_id makes it a subtask of that task."""
+    audit("add_task", tasklist=tasklist, chars=len(title) + len(notes), due=due, parent=bool(parent_id))
+    if not title.strip():
+        raise BridgeError("Give the task a title")
+    body: dict[str, Any] = {"title": title.strip()}
+    if notes.strip():
+        body["notes"] = notes
+    note = ""
+    if due.strip():
+        body["due"], note = _gt_due(due)
+    tl = _gt_pick_list(tasklist)
+    params = {"parent": parent_id.strip()} if parent_id.strip() else None
+    t = _gt_api("POST", f"/lists/{_q(tl['id'])}/tasks", params=params, body=body)
+    when = f", due {str(t['due'])[:10]}" if t.get("due") else ""
+    return f"Added to {tl.get('title')!r}{when} (id: {t.get('id')}).{note}"
+
+
+def update_task(task_id: str, tasklist: str = "", title: str = "", notes: str | None = None, due: str = "",
+                clear_due: bool = False, done: bool | None = None) -> str:
+    """Change one of Raph's Google Tasks: title, notes (an empty string clears them), due (a date like 2026-11-20),
+    clear_due=True to remove the due date, done=True to tick it off or done=False to reopen it. Only what you pass
+    changes. tasklist (title or id) is optional: without it every list is searched for task_id."""
+    audit("update_task", task_id=task_id, tasklist=tasklist, title=bool(title), notes=notes is not None, due=due,
+          clear_due=clear_due, done=done)
+    tl, task = _gt_find(task_id, tasklist)
+    body: dict[str, Any] = {}
+    note = ""
+    if title.strip():
+        body["title"] = title.strip()
+    if notes is not None:
+        body["notes"] = notes
+    if clear_due:
+        body["due"] = None
+    elif due.strip():
+        body["due"], note = _gt_due(due)
+    if done is True:
+        body["status"] = "completed"
+    elif done is False:
+        body.update(status="needsAction", completed=None)
+    if not body:
+        raise BridgeError("Nothing to change: pass title, notes, due, clear_due or done")
+    t = _gt_api("PATCH", f"/lists/{_q(tl['id'])}/tasks/{_q(task['id'])}", body=body)
+    state = "done" if t.get("status") == "completed" else "to do"
+    when = f", due {str(t['due'])[:10]}" if t.get("due") else ", no due date"
+    return f"Updated {(t.get('title') or '').strip()!r} in {tl.get('title')!r}: {state}{when}.{note}"
+
+
+def delete_task(task_id: str, reason: str, tasklist: str = "") -> str:
+    """Delete one of Raph's Google Tasks, only when he asked or agreed. Ticking it off (update_task done=True) is
+    usually what he means by "done". Deleting also deletes its subtasks. reason: why, in a few words (for the log)."""
+    audit("delete_task", task_id=task_id, tasklist=tasklist, reason=reason)
+    if not reason.strip():
+        raise BridgeError("Say why (e.g. 'Raph asked'): deletion is only for tasks he asked or agreed to remove")
+    tl, task = _gt_find(task_id, tasklist)
+    _gt_api("DELETE", f"/lists/{_q(tl['id'])}/tasks/{_q(task['id'])}")
+    return (f"Deleted {(task.get('title') or '').strip()!r} from {tl.get('title')!r}. Google Tasks has no undo for this "
+            "through the API; to bring it back, add it again.")
+
+
+if GTASKS.get("enabled", True):
+    for _fn, _ann in ((connect_google_tasks, GWR), (list_task_lists, GRO), (list_tasks, GRO), (add_task, GWR),
+                      (update_task, GWR), (delete_task, GDEL)):
+        mcp.tool(annotations=_ann)(_fn)
 
 
 # ---------------------------------------------------------------- HTTP routes (links, health)

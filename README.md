@@ -5,7 +5,7 @@ Lets Claude, from any device (phone included), reach two folders on your Windows
 - **Files**: your documents (papers, scans, letters, office files...)
 - **Notes**: your Markdown notes
 
-It can also use **Chrome on the PC**. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
+It can also use **Chrome on the PC** and your **Google Tasks**. It's a small background server, published to the internet with **Tailscale Funnel** and protected by a secret token. It does nothing while nobody uses it, and it updates itself.
 
 ## Install
 
@@ -35,7 +35,7 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 
 ## Tools
 
-30 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
+36 tools. "Allow" means it can't change anything (or only shows status); "Ask" means it changes files or acts in your browser.
 
 | Tool | What it does | Suggested |
 |---|---|---|
@@ -66,6 +66,10 @@ Then set the tool permissions; [Tools](#tools) suggests one for each.
 | `browser_batch` | several of the above in one go | Ask |
 
 | `file_upload` | attach files from Files or Notes to a page, e.g. email attachments (up to 10 MB in one go) | Ask |
+| `connect_google_tasks` | sign in to Google Tasks, check the sign-in, or sign out | Ask |
+| `list_task_lists` / `list_tasks` | your Google Tasks lists and tasks | Allow |
+| `add_task` / `update_task` | add a task; change, tick off or reopen one | Ask |
+| `delete_task` | delete a task, when you asked or agreed | Ask |
 
 Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_browsers`, `select_browser` and `switch_browser`. The bridge picks the browser itself.
 
@@ -79,6 +83,7 @@ Not offered: `upload_image`, `gif_creator`, `resize_window`, `list_connected_bro
 - **Hidden:** `.obsidian` (plugin code and settings), `.git`, `.ssh`, password databases and key files.
 - **Secret files are link-only:** a file with `.secret` in its name (`synci-token.secret.txt`, `api.secret`) is for tokens, API keys and passwords that Claude's scripts need. It's listed, marked `[secret: link only]`, and Claude can fetch it with a download link, which then works once, for at most 5 minutes, or replace it with an upload link. The bytes go straight between the PC and a file in Claude's workspace. No tool reads, searches, edits or attaches it to a web page, so its contents can't end up in a chat, even by a fallback or a mistake. Every refusal tells Claude the right way to use it instead: save it to a private file, let the script read it from there, never print it. Change the pattern with `secret_files` in `config.json`.
 - **Chrome:** everything happens inside Chrome, under the Claude in Chrome extension's own site permissions.
+- **Google Tasks:** your own Google OAuth client, signed in to the Tasks permission only. The client and the sign-in live in one secret file in Files, so no tool can show them, and access tokens stay in memory. The bridge only calls Google's own fixed addresses, and never logs task titles or notes.
 - **Uploads to websites only from Files and Notes:** `file_upload` takes bridge paths, which are checked like any other file tool, so hidden folders, keys and password files are excluded. The bridge then hands Chrome the files' contents. Claude Code itself can't read files on the PC, so nothing else can be uploaded.
 - **Updates come only from this repo's releases,** checked against their SHA-256. An update never turns a switched-off bridge back on.
 - **Everything is logged** in `logs\bridge.log`, without the text Claude types or writes.
@@ -137,6 +142,37 @@ The bridge runs the Claude in Chrome server that comes with **Claude Code**, and
 **Settings** (under `"chrome"`): `enabled`, `idle_minutes`, `profile` (a Chrome profile folder such as `"Profile 1"`, if Claude in Chrome is not in the default one), `device_id`, `permission_mode`, `call_timeout_seconds`, `claude_path`.
 
 If something's wrong, ask Claude to run `chrome_status`, or look at `logs\chrome-mcp.log`.
+
+## Google Tasks
+
+The tasks you add in Google Calendar or the Tasks app aren't calendar events, so Google Calendar connectors can't see
+them. The bridge talks to Google's Tasks API directly, with your own OAuth client. Plain HTTPS from the bridge: nothing
+extra to install, and no browser or screen needed on the PC.
+
+**Set up once** (about 10 minutes, on any device, at [console.cloud.google.com](https://console.cloud.google.com)):
+
+1. Create a project.
+2. **APIs & Services > Library:** enable **Google Tasks API**.
+3. **Google Auth Platform:** get started as an **External** app, with your own email as the support and contact address.
+   Then **Audience > Publish app**, so it says **In production**. While it says Testing, Google ends the sign-in after
+   7 days. No verification is needed for your own use.
+4. **Clients > Create client > Desktop app**, then download its JSON.
+5. Save that file as `Files/Claude/google-tasks.secret.json` (keep `.secret` in the name).
+
+**Sign in:** ask Claude to connect Google Tasks. It sends you a Google link. Open it on any device, allow access to your
+tasks (if Google says the app isn't verified, it's your own: **Advanced > Go to ...**). The page then fails to load
+(`127.0.0.1`): that's expected. Copy its whole address and paste it into the chat. The code in it works once and is
+useless without a key that never leaves the bridge. Finish with the same PC's connector that made the link.
+
+The sign-in is saved in the same secret file, so every PC that syncs Files is signed in. To sign out, ask Claude to
+disconnect Google Tasks (it also revokes the sign-in at Google), or remove access at
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+
+**Limits (Google's):** due dates are dates only (the API drops any time of day), and tasks assigned to you from Chat
+spaces or Docs may not show up.
+
+**Settings** (under `"google_tasks"`): `enabled` (default `true`), `secret_file` (default
+`Files/Claude/google-tasks.secret.json`; it must have `.secret` in its name).
 
 ## Updates
 

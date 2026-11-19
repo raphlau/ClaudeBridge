@@ -49,6 +49,10 @@
     "lockout_minutes": 60,
     "alert_url": ""
   },
+  "google_tasks": {
+    "enabled": true,
+    "secret_file": "Files/Claude/google-tasks.secret.json"
+  },
   "update": {
     "auto": true
   },
