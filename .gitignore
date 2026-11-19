@@ -4,8 +4,6 @@ logs/
 history/
 .venv/
 __pycache__/
-chrome_tools.json
-chrome_state.json
 update_state.json
 update_request.json
 previous/

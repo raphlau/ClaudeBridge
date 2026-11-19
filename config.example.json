@@ -38,11 +38,6 @@
     "max_upload_mb": 500,
     "link_minutes": 15
   },
-  "chrome": {
-    "enabled": true,
-    "idle_minutes": 10,
-    "profile": ""
-  },
   "security": {
     "max_bad_tokens": 10,
     "window_minutes": 10,

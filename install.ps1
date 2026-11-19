@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Installs Claude Bridge: a small background server that lets Claude read and edit two folders on this PC,
-  Files (documents) and Notes, and use Chrome here; published through Tailscale Funnel.
+  Files (documents) and Notes; published through Tailscale Funnel.
 
 .USAGE
   Easiest, in PowerShell from the Start menu (no need for admin):
@@ -179,7 +179,7 @@ if (-not $token -or $token -notmatch '^[A-Za-z0-9_-]{32,}$') {
 }
 
 # Each folder is just a name and a path: both are writable, and the bridge works out by itself which app syncs
-# them (Obsidian, MEGA) and where Chrome is, so the config has no app list.
+# them (Obsidian, MEGA), so the config has no app list.
 $cfgOut = [ordered]@{
     listen_port = $Port
     public_url  = "https://$dns"
@@ -187,7 +187,7 @@ $cfgOut = [ordered]@{
     roots       = @($roots | ForEach-Object { [ordered]@{ name = $_.name; path = $_.path } })
     quiet       = $true
 }
-# Keep the settings you added by hand (chrome, security, update, limits, deny lists...; see README)
+# Keep the settings you added by hand (security, update, limits, deny lists...; see README)
 if ($cfg) {
     foreach ($prop in $cfg.PSObject.Properties) {
         if (-not $cfgOut.Contains($prop.Name) -and $prop.Name -ne 'apps') { $cfgOut[$prop.Name] = $prop.Value }

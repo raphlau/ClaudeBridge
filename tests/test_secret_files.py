@@ -106,10 +106,6 @@ class SecretFileTests(unittest.TestCase):
         self.assertRefusedWithHelp(server.append_text, "Files/Money/api.secret.txt", "x")
         self.assertEqual((self.dir / "api.secret.txt").read_text(encoding="utf-8"), FAKE)
 
-    def test_not_attachable_to_web_pages(self):
-        self.assertRefusedWithHelp(server._upload_files, ["Files/Money/plain.txt", "Files/Money/api.secret.txt"])
-        self.assertEqual(len(server._upload_files(["Files/Money/plain.txt"])), 1)
-
     # -- links work, and a secret's download link works once, briefly
     def test_download_link_is_one_use_and_short(self):
         out = server.create_download_link("Files/Money/api.secret.txt", minutes=60)
